@@ -1,0 +1,41 @@
+{
+  "timestamp": "20260530_171250",
+  "job_id": "cf711bb70a2b",
+  "orthophoto_file": "C:\\Users\\bomag\\Documents\\SKRIPSI\\rice_classification_api\\output\\orthophoto\\cf711bb70a2b\\rice_paddy_cf711bb70a2b_orthophoto.tif",
+  "orthophoto_width": 3369,
+  "orthophoto_height": 1675,
+  "crs": "EPSG:32748",
+  "bounds": [
+    782756.0226931263,
+    9238377.99751755,
+    782924.441783438,
+    9238461.712991493
+  ],
+  "bounds_wgs84": [
+    107.55854693865939,
+    -6.883452527892313,
+    107.56007391734343,
+    -6.882687844212711
+  ],
+  "n_pixels_total": 5643075,
+  "n_pixels_valid": 3428923,
+  "n_pixels_rice": 1165142,
+  "n_pixels_yellow": 230168,
+  "n_pixels_green": 934974,
+  "yellow_pct_of_rice": 19.75,
+  "green_pct_of_rice": 80.25,
+  "valid_pct_of_total": 60.76,
+  "rice_pct_of_valid": 33.98,
+  "threshold_used": 0.6,
+  "verdict": "BELUM SIAP PANEN",
+  "verdict_class": 2,
+  "confidence_margin_pp": -40.25,
+  "files": {
+    "orthophoto": "output\\orthophoto\\cf711bb70a2b\\rice_paddy_cf711bb70a2b_orthophoto.tif",
+    "classification": "output\\classification\\rice_paddy_cf711bb70a2b_orthophoto_class_20260530_171250.tif",
+    "orthophoto_web_png": "output\\orthophoto_web\\rice_paddy_cf711bb70a2b_orthophoto_ortho_web_20260530_171250.png",
+    "classification_overlay_png": "output\\classification_web\\rice_paddy_cf711bb70a2b_orthophoto_class_overlay_20260530_171250.png",
+    "visualization": "output\\visualization\\rice_paddy_cf711bb70a2b_orthophoto_map_20260530_171250.png"
+  },
+  "duration_seconds": 9.84
+}

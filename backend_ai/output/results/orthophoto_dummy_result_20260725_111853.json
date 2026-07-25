@@ -1,0 +1,41 @@
+{
+  "timestamp": "20260725_111853",
+  "job_id": null,
+  "orthophoto_file": "C:\\Users\\taufi\\Documents\\Harvest\\backend\\data\\orthophoto_dummy.tif",
+  "orthophoto_width": 100,
+  "orthophoto_height": 100,
+  "crs": "EPSG:4326",
+  "bounds": [
+    106.8,
+    -6.2010000000000005,
+    106.801,
+    -6.2
+  ],
+  "bounds_wgs84": [
+    106.8,
+    -6.2010000000000005,
+    106.801,
+    -6.2
+  ],
+  "n_pixels_total": 10000,
+  "n_pixels_valid": 4000,
+  "n_pixels_rice": 3990,
+  "n_pixels_yellow": 3592,
+  "n_pixels_green": 398,
+  "yellow_pct_of_rice": 90.03,
+  "green_pct_of_rice": 9.97,
+  "valid_pct_of_total": 40.0,
+  "rice_pct_of_valid": 99.75,
+  "threshold_used": 0.6,
+  "verdict": "SIAP PANEN",
+  "verdict_class": 1,
+  "confidence_margin_pp": 30.03,
+  "files": {
+    "orthophoto": "data\\orthophoto_dummy.tif",
+    "classification": "output\\classification\\orthophoto_dummy_class_20260725_111853.tif",
+    "orthophoto_web_png": "output\\orthophoto_web\\orthophoto_dummy_ortho_web_20260725_111853.png",
+    "classification_overlay_png": "output\\classification_web\\orthophoto_dummy_class_overlay_20260725_111853.png",
+    "visualization": "output\\visualization\\orthophoto_dummy_map_20260725_111853.png"
+  },
+  "duration_seconds": 24.88
+}

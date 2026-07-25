@@ -1,18 +1,34 @@
-# ROS 2 Build Caches
-project/ros2_ws/build/
-project/ros2_ws/install/
-project/ros2_ws/log/
+# Node & Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+node_modules/
+package-lock.json
 
-# Next.js & Node Caches
-project/frontend/node_modules/
-project/frontend/.next/
-
-# Python caches
-__pycache__/
+# Python & Virtual Environments
+backend_ai/venv/
+backend_ai/uploads/
+venv/
 *.pyc
+__pycache__/
+*.pyo
 
-# External Repositories (too large to upload directly, should be handled via git submodules or excluded)
-# Jika Anda ingin mengunggahnya utuh (tidak disarankan), hapus 2 baris di bawah ini.
-# Namun sangat disarankan menggunakan Git Submodule untuk modul external ini.
+# ROS 2 Build Caches
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# Environment Variables & Logs
+.env
+logs/*.log
+logs/*.pid
+
+# External Repositories (Heavy source trees)
 external/PX4-Autopilot/
 external/Micro-XRCE-DDS-Agent/
+
+# Backups & Temporary files
+legacy_backups/
+*.swp
+*.tmp
+.DS_Store
