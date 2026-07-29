@@ -1,223 +1,316 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback } from "react";
-import ROSLIB from "roslib";
+/**
+ * lib/useRos.ts
+ * =============================================================================
+ * Hook penghubung dashboard <-> ROS 2 bridge.
+ *
+ * PERBAIKAN DESINKRONISASI PALING KRITIS
+ * --------------------------------------
+ * Versi sebelumnya berbicara dengan protokol yang TIDAK ADA:
+ *
+ *   Dashboard lama          | Node ROS 2 sebenarnya
+ *   ------------------------|-----------------------------------------
+ *   sub  /drone/telemetry   | pub  /dashboard/telemetry, /dashboard/state
+ *   sub  /drone/pose        | pub  /odom
+ *   pub  /drone/cmd (JSON)  | service /arm /takeoff /land /return_home ...
+ *                           | sub  /cmd_vel, /dashboard/goal_pose
+ *
+ * Tidak ada satu pun topik yang cocok. Akibatnya dashboard selamanya
+ * menampilkan telemetry default (baterai 100%, altitude 0) dan SETIAP tombol
+ * kontrol tidak berefek apa pun ke drone — pesan diterbitkan ke topik yang
+ * tidak pernah didengarkan siapa pun. Modul ini memakai protokol yang benar.
+ */
 
-export interface TelemetryData {
-  x: number;
-  y: number;
-  z: number;
-  lat: number;
-  lon: number;
-  alt: number;
-  vx: number;
-  vy: number;
-  vz: number;
-  speed: number;
-  yaw: number;
-  pitch: number;
-  roll: number;
-  heading: number;
-  battery: number;
-  voltage: number;
-  flightMode: string;
-  armed: boolean;
-  navState: string;
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import {
+  DEFAULT_ROSBRIDGE_URL,
+  getRosClient,
+  type ConnectionPhase,
+  type ServiceAck,
+} from "./rosClient";
+import {
+  DEFAULT_TELEMETRY,
+  telemetryStore,
+  type TelemetryData,
+  type TrailPoint,
+  type VehicleState,
+  type Waypoint,
+} from "./telemetryStore";
+
+export type { TelemetryData, Waypoint, TrailPoint, VehicleState };
+
+const TRIGGER = "std_srvs/srv/Trigger";
+
+// -----------------------------------------------------------------------------
+// Selector hooks — komponen hanya berlangganan slice yang dibutuhkannya
+// -----------------------------------------------------------------------------
+
+/** Telemetry frekuensi tinggi, sudah dibatasi ke ~20Hz oleh store. */
+export function useTelemetry(): TelemetryData {
+  return useSyncExternalStore(
+    telemetryStore.subscribeTelemetry,
+    telemetryStore.getTelemetrySnapshot,
+    () => DEFAULT_TELEMETRY
+  );
 }
 
-export interface Waypoint {
-  id: number;
-  x: number;
-  y: number;
-  z: number;
-  lat?: number;
-  lon?: number;
+/** State kendaraan frekuensi rendah — hanya berubah saat nilainya berubah. */
+export function useVehicleState(): VehicleState {
+  return useSyncExternalStore(
+    telemetryStore.subscribeVehicle,
+    telemetryStore.getVehicleSnapshot,
+    telemetryStore.getVehicleSnapshot
+  );
 }
 
-const defaultTelemetry: TelemetryData = {
-  x: 0,
-  y: 0,
-  z: 0,
-  lat: -6.9175,
-  lon: 107.6191,
-  alt: 0,
-  vx: 0,
-  vy: 0,
-  vz: 0,
-  speed: 0,
-  yaw: 0,
-  pitch: 0,
-  roll: 0,
-  heading: 0,
-  battery: 100,
-  voltage: 15.6,
-  flightMode: "MANUAL",
-  armed: false,
-  navState: "STANDBY",
-};
+/** Jejak terbang. Terpisah supaya HUD tidak ikut render saat trail bertambah. */
+export function useFlightTrail(): TrailPoint[] {
+  return useSyncExternalStore(
+    telemetryStore.subscribeTrail,
+    telemetryStore.getTrailSnapshot,
+    () => [] as TrailPoint[]
+  );
+}
 
-export function useRos(wsUrl: string = "ws://localhost:9090") {
-  const [connected, setConnected] = useState<boolean>(false);
-  const [connecting, setConnecting] = useState<boolean>(true);
-  const [telemetry, setTelemetry] = useState<TelemetryData>(defaultTelemetry);
+// -----------------------------------------------------------------------------
+// Hook utama
+// -----------------------------------------------------------------------------
+export function useRos(wsUrl: string = DEFAULT_ROSBRIDGE_URL) {
+  const [phase, setPhase] = useState<ConnectionPhase>("connecting");
   const [waypoints, setWaypoints] = useState<Waypoint[]>([]);
-  const [flightPath, setFlightPath] = useState<{ x: number; y: number }[]>([]);
-  const rosRef = useRef<ROSLIB.Ros | null>(null);
+  const [lastAck, setLastAck] = useState<ServiceAck | null>(null);
 
+  const clientRef = useRef<ReturnType<typeof getRosClient> | null>(null);
+  const seqRef = useRef(0);
+  /** Waypoint yang menunggu ACK; disimpan di ref agar tidak memicu render. */
+  const pendingWaypointsRef = useRef<{ seq: number; list: Waypoint[] } | null>(null);
+
+  const vehicle = useVehicleState();
+
+  // ---------------------------------------------------------------------------
+  // Koneksi, subscription, dan resync
+  // ---------------------------------------------------------------------------
   useEffect(() => {
-    let ros: ROSLIB.Ros | null = null;
-    let isMounted = true;
+    const client = getRosClient(wsUrl);
+    clientRef.current = client;
+    setPhase(client.phase);
 
-    try {
-      ros = new ROSLIB.Ros({
-        url: wsUrl,
-      });
+    const unsubPhase = client.onPhaseChange((next) => {
+      setPhase(next);
+      if (next !== "connected") telemetryStore.resetForDisconnect();
+    });
 
-      ros.on("connection", () => {
-        if (isMounted) {
-          console.log("[ROSBridge] Connected to WebSocket at:", wsUrl);
-          setConnected(true);
-          setConnecting(false);
-        }
-      });
-
-      ros.on("error", (error: any) => {
-        if (isMounted) {
-          console.warn("[ROSBridge] Connection error:", error);
-          setConnected(false);
-          setConnecting(false);
-        }
-      });
-
-      ros.on("close", () => {
-        if (isMounted) {
-          console.log("[ROSBridge] Connection closed");
-          setConnected(false);
-          setConnecting(false);
-        }
-      });
-
-      rosRef.current = ros;
-
-      // Subscribe to telemetry topic /drone/telemetry or /px4_telemetry
-      const telemTopic = new ROSLIB.Topic({
-        ros: ros,
-        name: "/drone/telemetry",
-        messageType: "std_msgs/msg/String",
-      });
-
-      telemTopic.subscribe((message: any) => {
-        if (!isMounted) return;
+    // Telemetry padat 20Hz dari node — satu pesan, satu parse.
+    const unsubTelemetry = client.subscribe(
+      "/dashboard/telemetry",
+      "std_msgs/msg/String",
+      (message: any) => {
         try {
-          const data = typeof message.data === "string" ? JSON.parse(message.data) : message;
-          setTelemetry((prev) => {
-            const nextTelem = { ...prev, ...data };
-            if (data.x !== undefined && data.y !== undefined) {
-              setFlightPath((path) => [...path.slice(-100), { x: data.x, y: data.y }]);
-            }
-            return nextTelem;
+          const data = JSON.parse(message.data);
+          telemetryStore.ingestTelemetry({
+            x: data.x,
+            y: data.y,
+            z: data.z,
+            alt: data.alt,
+            vx: data.vx,
+            vy: data.vy,
+            vz: data.vz,
+            speed: data.speed,
+            yaw: data.yaw,
+            heading: data.heading,
+            battery: data.battery ?? undefined,
+            voltage: data.voltage,
+            armed: data.armed,
+            flightMode: data.flightMode,
+            navState: data.navState,
+            stampMs: data.stamp_ms,
           });
-        } catch (e) {
-          // ignore parse errors
+        } catch (err) {
+          console.warn("[useRos] Payload telemetry tidak bisa diparse:", err);
         }
-      });
+      }
+    );
 
-      // Subscribe to pose topic /drone/pose if available
-      const poseTopic = new ROSLIB.Topic({
-        ros: ros,
-        name: "/drone/pose",
-        messageType: "geometry_msgs/msg/PoseStamped",
-      });
-
-      poseTopic.subscribe((msg: any) => {
-        if (!isMounted) return;
-        const pos = msg.pose?.position;
-        if (pos) {
-          setTelemetry((prev) => ({
-            ...prev,
-            x: pos.x || 0,
-            y: pos.y || 0,
-            z: pos.z || 0,
-            alt: pos.z || 0,
-          }));
-          setFlightPath((path) => [...path.slice(-100), { x: pos.x || 0, y: pos.y || 0 }]);
+    // State 2Hz: mode, home, goal, journey status, dan event ACK.
+    const unsubState = client.subscribe(
+      "/dashboard/state",
+      "std_msgs/msg/String",
+      (message: any) => {
+        try {
+          const payload = JSON.parse(message.data);
+          if (payload && typeof payload.event === "string") {
+            telemetryStore.ingestEvent(payload);
+          } else {
+            telemetryStore.ingestState(payload);
+          }
+        } catch (err) {
+          console.warn("[useRos] Payload state tidak bisa diparse:", err);
         }
-      });
-    } catch (err) {
-      console.error("[ROSBridge] Error initializing ROSLIB:", err);
-      setConnecting(false);
-    }
+      }
+    );
+
+    // FULL STATE RESYNCHRONIZATION.
+    // Setiap kali socket pulih, minta node menerbitkan snapshot lengkap segera
+    // agar UI tidak menampilkan state basi selama menunggu tick periodik.
+    const unsubReconnect = client.onReconnect(() => {
+      client
+        .callService("/dashboard/resync", TRIGGER, {}, 4000)
+        .then((ack) => {
+          if (!ack.success) {
+            console.warn("[useRos] Resync ditolak node:", ack.message);
+            return;
+          }
+          try {
+            telemetryStore.ingestState(JSON.parse(ack.message));
+          } catch {
+            /* node membalas pesan teks biasa — abaikan */
+          }
+        })
+        .catch((err) => console.warn("[useRos] Resync gagal:", err));
+    });
 
     return () => {
-      isMounted = false;
-      if (ros) {
-        try {
-          ros.close();
-        } catch (e) {}
-      }
+      unsubPhase();
+      unsubTelemetry();
+      unsubState();
+      unsubReconnect();
+      telemetryStore.dispose();
+      // Client sengaja TIDAK di-dispose: ia singleton per URL dan dipakai
+      // ulang antar-navigasi, jadi tidak perlu handshake WebSocket baru.
     };
   }, [wsUrl]);
 
-  const sendCommand = useCallback((command: string, params: any = {}) => {
-    if (!rosRef.current || !rosRef.current.isConnected) {
-      console.warn("[ROSBridge] Cannot send command, ROS not connected");
-      return false;
-    }
-    try {
-      const cmdTopic = new ROSLIB.Topic({
-        ros: rosRef.current,
-        name: "/drone/cmd",
-        messageType: "std_msgs/msg/String",
-      });
+  // ---------------------------------------------------------------------------
+  // Rekonsiliasi ACK waypoint
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    const pending = pendingWaypointsRef.current;
+    if (!pending || vehicle.ackedSeq !== pending.seq) return;
+    // Node mengonfirmasi seq ini — baru sekarang UI menandai waypoint valid.
+    pendingWaypointsRef.current = null;
+    setWaypoints(pending.list.map((wp) => ({ ...wp, confirmed: true })));
+  }, [vehicle.ackedSeq]);
 
-      const payload = JSON.stringify({ command, ...params });
-      cmdTopic.publish(new ROSLIB.Message({ data: payload }));
-      console.log(`[ROSBridge] Published command: ${command}`, params);
-      return true;
-    } catch (e) {
-      console.error("[ROSBridge] Error publishing command:", e);
-      return false;
-    }
+  // ---------------------------------------------------------------------------
+  // Command helpers
+  // ---------------------------------------------------------------------------
+  const callTrigger = useCallback(async (service: string): Promise<ServiceAck> => {
+    const client = clientRef.current;
+    if (!client) return { success: false, message: "Client ROS belum siap." };
+    const ack = await client.callService(service, TRIGGER);
+    setLastAck(ack);
+    if (!ack.success) console.warn(`[useRos] ${service} ditolak:`, ack.message);
+    return ack;
   }, []);
 
-  const arm = useCallback(() => sendCommand("ARM"), [sendCommand]);
-  const disarm = useCallback(() => sendCommand("DISARM"), [sendCommand]);
-  const takeoff = useCallback((altitude: number = 5.0) => sendCommand("TAKEOFF", { altitude }), [sendCommand]);
-  const land = useCallback(() => sendCommand("LAND"), [sendCommand]);
-  const rth = useCallback(() => sendCommand("RTH"), [sendCommand]);
-  const setFlightMode = useCallback((mode: string) => sendCommand("SET_MODE", { mode }), [sendCommand]);
-  
-  const addWaypoint = useCallback((wp: Waypoint) => {
-    setWaypoints((prev) => [...prev, wp]);
+  const arm = useCallback(() => callTrigger("/arm"), [callTrigger]);
+  const disarm = useCallback(() => callTrigger("/disarm"), [callTrigger]);
+  const land = useCallback(() => callTrigger("/land"), [callTrigger]);
+  const rth = useCallback(() => callTrigger("/return_home"), [callTrigger]);
+  const emergencyStop = useCallback(() => callTrigger("/emergency_stop"), [callTrigger]);
+  const startAutoSurvey = useCallback(() => callTrigger("/start_auto_survey"), [callTrigger]);
+  const startOrbitMission = useCallback(() => callTrigger("/start_orbit_mission"), [callTrigger]);
+  const forceArmTakeoff = useCallback(() => callTrigger("/force_arm_takeoff"), [callTrigger]);
+
+  /** Takeoff. Altitude dikirim lebih dulu supaya node memakai nilai dari UI. */
+  const takeoff = useCallback(
+    async (altitude: number = 8.0): Promise<ServiceAck> => {
+      const client = clientRef.current;
+      if (!client) return { success: false, message: "Client ROS belum siap." };
+      client.publish("/dashboard/takeoff_altitude", "std_msgs/msg/Float32", {
+        data: Number(altitude) || 8.0,
+      });
+      return callTrigger("/takeoff");
+    },
+    [callTrigger]
+  );
+
+  /** Kontrol manual berbasis kecepatan lewat /cmd_vel. */
+  const sendVelocity = useCallback(
+    (vx: number, vy: number, vz: number, yawRate: number): boolean => {
+      const client = clientRef.current;
+      if (!client) return false;
+      return client.publish("/cmd_vel", "geometry_msgs/msg/Twist", {
+        linear: { x: vx, y: vy, z: vz },
+        angular: { x: 0, y: 0, z: yawRate },
+      });
+    },
+    []
+  );
+
+  /** Kirim satu target tunggal ke planner A* node. */
+  const setGoal = useCallback((wp: Waypoint): boolean => {
+    const client = clientRef.current;
+    if (!client) return false;
+    const ok = client.publish("/dashboard/goal_pose", "geometry_msgs/msg/PoseStamped", {
+      header: { frame_id: "map", stamp: { sec: 0, nanosec: 0 } },
+      pose: {
+        position: { x: wp.x, y: wp.y, z: wp.z },
+        orientation: { x: 0, y: 0, z: 0, w: 1 },
+      },
+    });
+    if (ok) setWaypoints([{ ...wp, confirmed: false }]);
+    return ok;
+  }, []);
+
+  /**
+   * Kirim daftar waypoint dengan pola ACK.
+   *
+   * UI TIDAK langsung menandai waypoint sebagai aktif. Ia menyimpan seq di ref,
+   * dan status baru diperbarui setelah node membalas "waypoints_ack" dengan seq
+   * yang sama (lihat efek rekonsiliasi di atas). Kalau node menolak, UI tetap
+   * menampilkan status pending, bukan berbohong bahwa misi sudah terkirim.
+   */
+  const sendWaypoints = useCallback((wpList: Waypoint[]): boolean => {
+    const client = clientRef.current;
+    if (!client || wpList.length === 0) return false;
+
+    const seq = ++seqRef.current;
+    const ok = client.publish("/dashboard/waypoints", "std_msgs/msg/String", {
+      data: JSON.stringify({
+        seq,
+        waypoints: wpList.map((wp) => ({ x: wp.x, y: wp.y, z: wp.z })),
+      }),
+    });
+
+    if (ok) {
+      pendingWaypointsRef.current = { seq, list: wpList };
+      setWaypoints(wpList.map((wp) => ({ ...wp, confirmed: false })));
+    }
+    return ok;
   }, []);
 
   const clearWaypoints = useCallback(() => {
+    pendingWaypointsRef.current = null;
     setWaypoints([]);
+    telemetryStore.clearTrail();
   }, []);
 
-  const sendWaypoints = useCallback(
-    (wpList: Waypoint[]) => {
-      setWaypoints(wpList);
-      return sendCommand("UPLOAD_WAYPOINTS", { waypoints: wpList });
-    },
-    [sendCommand]
-  );
+  const addWaypoint = useCallback((wp: Waypoint) => {
+    setWaypoints((prev) => [...prev, { ...wp, confirmed: false }]);
+  }, []);
 
   return {
-    connected,
-    connecting,
-    telemetry,
+    connected: phase === "connected",
+    connecting: phase === "connecting" || phase === "reconnecting",
+    phase,
     waypoints,
-    flightPath,
+    lastAck,
+    vehicle,
     arm,
     disarm,
     takeoff,
     land,
     rth,
-    setFlightMode,
+    emergencyStop,
+    forceArmTakeoff,
+    startAutoSurvey,
+    startOrbitMission,
+    sendVelocity,
+    setGoal,
     addWaypoint,
     clearWaypoints,
     sendWaypoints,
-    sendCommand,
   };
 }

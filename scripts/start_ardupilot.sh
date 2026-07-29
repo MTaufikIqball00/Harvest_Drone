@@ -25,4 +25,10 @@ echo "    - TCP 5760                                          "
 echo "========================================================="
 
 cd "$ARDUPILOT_DIR/ArduCopter"
-"$ARDUPILOT_DIR/Tools/autotest/sim_vehicle.py" -v ArduCopter --console --map --out=udp:127.0.0.1:14550
+# Dua output MAVLink terpisah:
+#   14550 -> Mission Planner / QGroundControl (GCS manusia)
+#   14551 -> MAVROS (dashboard). Port SENDIRI supaya tidak berebut dengan GCS;
+#            dua klien pada satu port UDP saling mencuri paket.
+"$ARDUPILOT_DIR/Tools/autotest/sim_vehicle.py" -v ArduCopter --console --map \
+    --out=udp:127.0.0.1:14550 \
+    --out=udp:127.0.0.1:14551

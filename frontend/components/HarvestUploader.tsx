@@ -1,8 +1,32 @@
 "use client";
 
-import React, { useState, useRef } from "react";
+/**
+ * components/HarvestUploader.tsx
+ * =============================================================================
+ * Uploader + orkestrator job klasifikasi panen.
+ *
+ * PERBAIKAN
+ * ---------
+ * 1. KEBOCORAN INTERVAL. Versi lama memanggil `setInterval` di dalam handler
+ *    klik tanpa pernah menyimpan handle-nya di ref/cleanup. Kalau komponen
+ *    di-unmount (pindah tab!) saat job berjalan, interval terus hidup selamanya,
+ *    memanggil `setState` pada komponen yang sudah mati dan membocorkan closure
+ *    beserta seluruh objek File yang dirujuknya.
+ * 2. DATA FIKTIF. Setelah 15 kali polling gagal, versi lama MEMBUAT hasil
+ *    klasifikasi palsu ("SIAP PANEN", 7.8 ton) dan menyerahkannya ke UI seolah
+ *    itu keluaran AI sungguhan. Untuk sistem pendukung keputusan panen ini
+ *    berbahaya. Sekarang kegagalan dilaporkan apa adanya.
+ * 3. Request dibatalkan lewat AbortController saat unmount, jadi tidak ada
+ *    fetch yatim.
+ */
+
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { api, type JobInfo, type ClassificationResult } from "@/lib/api";
-import { UploadCloud, CheckCircle2, AlertTriangle, Loader2, FileImage, Sparkles } from "lucide-react";
+import { UploadCloud, AlertTriangle, Loader2, FileImage, Sparkles } from "lucide-react";
+
+const POLL_INTERVAL_MS = 2000;
+/** Stitching ODM bisa lama; batasi total tunggu, jangan polling selamanya. */
+const MAX_POLL_ATTEMPTS = 900; // ~30 menit
 
 interface Props {
   onClassificationDone: (result: ClassificationResult) => void;
@@ -10,86 +34,118 @@ interface Props {
 
 export function HarvestUploader({ onClassificationDone }: Props) {
   const [files, setFiles] = useState<File[]>([]);
-  const [threshold, setThreshold] = useState<number>(0.60);
+  const [threshold, setThreshold] = useState<number>(0.6);
   const [loading, setLoading] = useState<boolean>(false);
   const [jobStatus, setJobStatus] = useState<JobInfo | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) {
-      setFiles(Array.from(e.target.files));
-    }
-  };
+  /** Dibatalkan saat unmount — mematikan polling DAN request yang menggantung. */
+  const abortRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(true);
 
-  const handleDrop = (e: React.DragEvent) => {
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      abortRef.current?.abort();
+    };
+  }, []);
+
+  const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) setFiles(Array.from(e.target.files));
+  }, []);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
-    if (e.dataTransfer.files) {
-      setFiles(Array.from(e.dataTransfer.files));
-    }
-  };
+    if (e.dataTransfer.files) setFiles(Array.from(e.dataTransfer.files));
+  }, []);
 
-  const handleUploadAndAnalyze = async () => {
+  /** Sleep yang menghormati sinyal abort — pengganti setInterval yang bocor. */
+  const delay = (ms: number, signal: AbortSignal) =>
+    new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, ms);
+      signal.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer);
+          reject(new DOMException("Aborted", "AbortError"));
+        },
+        { once: true }
+      );
+    });
+
+  const handleUploadAndAnalyze = useCallback(async () => {
     if (files.length === 0) return;
+
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const { signal } = controller;
+
     setLoading(true);
     setErrorMsg(null);
 
     try {
-      // Submit stitching/analysis job
-      const job = await api.submitStitchJob(files, threshold);
+      const job = await api.submitStitchJob(files, threshold, signal);
+      if (signal.aborted) return;
       setJobStatus(job);
 
-      // Poll status
-      let pollCount = 0;
-      const interval = setInterval(async () => {
-        pollCount++;
-        try {
-          const status = await api.getJobStatus(job.job_id);
-          setJobStatus(status);
+      // Loop polling sekuensial. Berbeda dari setInterval, loop ini tidak
+      // pernah menumpuk request kalau backend lambat merespons.
+      let attempts = 0;
+      let consecutiveErrors = 0;
 
-          if (status.status === "completed") {
-            clearInterval(interval);
-            const res = await api.classifyJob(job.job_id, threshold);
-            onClassificationDone(res);
-            setLoading(false);
-          } else if (status.status === "failed") {
-            clearInterval(interval);
-            setErrorMsg(status.message || "Pengolahan citra gagal.");
-            setLoading(false);
-          }
-        } catch (e) {
-          if (pollCount > 15) {
-            clearInterval(interval);
-            // Fallback simulation for demonstration if backend worker ODM is not active
-            const dummyResult: ClassificationResult = {
-              job_id: job.job_id,
-              status: "completed",
-              threshold,
-              verdict: "SIAP PANEN",
-              summary: {
-                total_area_m2: 12500,
-                harvest_ready_m2: 8750,
-                harvest_ready_percentage: 70.0,
-                estimated_yield_tons: 7.8,
-              },
-              classes: [
-                { name: "Padi Matang (Siap Panen)", pixels: 87500, area_m2: 8750, percentage: 70.0, color: "#f59e0b" },
-                { name: "Padi Hijau (Belum Matang)", pixels: 25000, area_m2: 2500, percentage: 20.0, color: "#10b981" },
-                { name: "Air / Genangan", pixels: 7500, area_m2: 750, percentage: 6.0, color: "#06b6d4" },
-                { name: "Tanah / Lainnya", pixels: 5000, area_m2: 500, percentage: 4.0, color: "#64748b" },
-              ],
-              bounds: [107.618, -6.918, 107.620, -6.916],
-            };
-            onClassificationDone(dummyResult);
-            setLoading(false);
-          }
+      while (!signal.aborted) {
+        await delay(POLL_INTERVAL_MS, signal);
+        attempts += 1;
+
+        if (attempts > MAX_POLL_ATTEMPTS) {
+          throw new Error(
+            `Job belum selesai setelah ${Math.round(
+              (MAX_POLL_ATTEMPTS * POLL_INTERVAL_MS) / 60000
+            )} menit. Periksa log NodeODM.`
+          );
         }
-      }, 2000);
+
+        let status: JobInfo;
+        try {
+          status = await api.getJobStatus(job.job_id, signal);
+          consecutiveErrors = 0;
+        } catch (err) {
+          if (signal.aborted) return;
+          consecutiveErrors += 1;
+          // Backend mungkin sedang restart — toleransi beberapa kegagalan,
+          // tetapi JANGAN mengarang hasil kalau akhirnya menyerah.
+          if (consecutiveErrors >= 10) {
+            throw new Error(
+              "Backend AI tidak merespons setelah 10 percobaan. Pastikan FastAPI & NodeODM berjalan."
+            );
+          }
+          continue;
+        }
+
+        if (!mountedRef.current) return;
+        setJobStatus(status);
+
+        if (status.status === "completed") {
+          const result = await api.classifyJob(job.job_id, threshold, signal);
+          if (!mountedRef.current || signal.aborted) return;
+          onClassificationDone(result);
+          setLoading(false);
+          return;
+        }
+
+        if (status.status === "failed") {
+          throw new Error(status.message || status.error || "Pengolahan citra gagal di backend.");
+        }
+      }
     } catch (err: any) {
-      setErrorMsg(err.message || "Gagal mengunggah foto drone.");
+      if (err?.name === "AbortError" || !mountedRef.current) return;
+      setErrorMsg(err?.message || "Gagal mengunggah foto drone.");
       setLoading(false);
     }
-  };
+  }, [files, threshold, onClassificationDone]);
 
   return (
     <div className="glass-panel p-6 rounded-xl border flex flex-col gap-4">
@@ -101,7 +157,6 @@ export function HarvestUploader({ onClassificationDone }: Props) {
         <span className="text-xs text-slate-400">FastAPI AI Engine</span>
       </div>
 
-      {/* Drag & Drop Zone */}
       <div
         onDragOver={(e) => e.preventDefault()}
         onDrop={handleDrop}
@@ -112,38 +167,39 @@ export function HarvestUploader({ onClassificationDone }: Props) {
           ref={inputRef}
           type="file"
           multiple
-          accept="image/*,.tif,.tiff"
+          accept="image/jpeg,.jpg,.jpeg"
           onChange={handleFileChange}
           className="hidden"
         />
         <UploadCloud className="w-10 h-10 text-emerald-400" />
         <div>
           <p className="text-sm font-medium text-slate-200">
-            Drag & drop citra orthophoto drone / foto udara di sini
+            Drag &amp; drop foto udara drone di sini
           </p>
           <p className="text-xs text-slate-400 mt-1">
-            Mendukung JPG, PNG, GeoTIFF dengan koordinat GPS EXIF
+            JPG/JPEG dengan EXIF GPS aktif — minimum 4 foto, overlap 70-80%
           </p>
         </div>
       </div>
 
-      {/* File List Badge */}
       {files.length > 0 && (
-        <div className="bg-slate-850 p-3 rounded-lg border border-slate-700 text-xs flex items-center justify-between">
+        <div className="bg-slate-900/60 p-3 rounded-lg border border-slate-700 text-xs flex items-center justify-between">
           <div className="flex items-center gap-2 text-slate-200 truncate">
             <FileImage className="w-4 h-4 text-cyan-400 flex-shrink-0" />
-            <span className="truncate">{files.length} file dipilih: {files.map((f) => f.name).join(", ")}</span>
+            <span className="truncate">
+              {files.length} file dipilih: {files.map((f) => f.name).join(", ")}
+            </span>
           </div>
           <button
             onClick={() => setFiles([])}
-            className="text-slate-400 hover:text-red-400 ml-2 text-xs"
+            disabled={loading}
+            className="text-slate-400 hover:text-red-400 disabled:opacity-40 ml-2 text-xs"
           >
             Clear
           </button>
         </div>
       )}
 
-      {/* Threshold Slider */}
       <div className="flex items-center justify-between gap-4 pt-2">
         <div className="flex flex-col gap-1 flex-1">
           <div className="flex justify-between text-xs text-slate-300">
@@ -163,8 +219,9 @@ export function HarvestUploader({ onClassificationDone }: Props) {
 
         <button
           onClick={handleUploadAndAnalyze}
-          disabled={files.length === 0 || loading}
-          className="py-2.5 px-6 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-slate-950 font-bold transition-all text-xs flex items-center gap-2 shadow-lg shadow-amber-950/40"
+          disabled={files.length < 4 || loading}
+          title={files.length < 4 ? "Minimum 4 foto" : undefined}
+          className="py-2.5 px-6 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-slate-950 font-bold transition-all text-xs flex items-center gap-2 shadow-lg"
         >
           {loading ? (
             <>
@@ -178,28 +235,31 @@ export function HarvestUploader({ onClassificationDone }: Props) {
         </button>
       </div>
 
-      {/* Status / Progress Indicator */}
       {jobStatus && (
         <div className="p-3 rounded-lg bg-slate-900 border border-slate-700/80 text-xs flex items-center gap-3">
-          <Loader2 className="w-4 h-4 text-amber-400 animate-spin flex-shrink-0" />
+          {loading && <Loader2 className="w-4 h-4 text-amber-400 animate-spin flex-shrink-0" />}
           <div className="flex-1">
             <div className="flex justify-between text-slate-300 font-medium">
-              <span>Status Job #{jobStatus.job_id?.slice(0, 8)}</span>
+              <span>Job #{jobStatus.job_id?.slice(0, 8)}</span>
               <span className="uppercase text-amber-400">{jobStatus.status}</span>
             </div>
             <div className="w-full bg-slate-800 h-1.5 rounded-full mt-1.5 overflow-hidden">
               <div
                 className="bg-amber-400 h-full transition-all duration-300"
-                style={{ width: `${jobStatus.progress || 40}%` }}
+                style={{ width: `${jobStatus.progress ?? 0}%` }}
               />
             </div>
+            {jobStatus.message && (
+              <div className="text-[10px] text-slate-400 mt-1">{jobStatus.message}</div>
+            )}
           </div>
         </div>
       )}
 
       {errorMsg && (
-        <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-300 text-xs flex items-center gap-2">
-          <AlertTriangle className="w-4 h-4 flex-shrink-0" /> {errorMsg}
+        <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-300 text-xs flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+          <span>{errorMsg}</span>
         </div>
       )}
     </div>

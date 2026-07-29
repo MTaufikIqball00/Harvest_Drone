@@ -52,3 +52,25 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: #10b981;
 }
+
+/* Marker drone berbasis divIcon — hilangkan kotak putih bawaan Leaflet.
+   Ini juga menghindari ikon marker default Leaflet yang URL-nya rusak di
+   bundler Next.js (marker tampil sebagai gambar patah). */
+.drone-marker,
+.target-marker {
+  background: transparent;
+  border: none;
+}
+
+.drone-marker__body {
+  /* will-change memberi tahu compositor untuk mempromosikan elemen ini ke
+     layer sendiri, sehingga rotasi yaw 15Hz tidak memicu repaint layer peta. */
+  will-change: transform;
+  transform-origin: 50% 50%;
+  filter: drop-shadow(0 0 4px rgba(56, 189, 248, 0.8));
+}
+
+/* Peta Leaflet: cegah layout thrash saat panel di sebelahnya berubah ukuran. */
+.leaflet-container.leaflet-touch-drag {
+  contain: layout paint;
+}

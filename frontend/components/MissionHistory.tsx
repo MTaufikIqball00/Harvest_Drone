@@ -1,7 +1,7 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
-import { Database, RefreshCw, Clock, ShieldCheck, Activity } from "lucide-react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { Database, RefreshCw } from "lucide-react";
 
 export function MissionHistory() {
   const [data, setData] = useState<{ missions: any[]; telemetryLogs: any[]; harvestJobs: any[] }>({
@@ -12,28 +12,40 @@ export function MissionHistory() {
   const [loading, setLoading] = useState<boolean>(true);
   const [activeTab, setActiveTab] = useState<"missions" | "telemetry" | "harvest">("missions");
 
-  const fetchHistory = async () => {
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // Simpan controller di ref supaya refresh berulang membatalkan request
+  // sebelumnya, dan unmount membatalkan yang sedang berjalan.
+  const abortRef = useRef<AbortController | null>(null);
+
+  const fetchHistory = useCallback(async () => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setLoading(true);
+    setErrorMsg(null);
     try {
-      const res = await fetch("/api/missions");
+      const res = await fetch("/api/missions", { signal: controller.signal });
       const json = await res.json();
-      if (json.success) {
-        setData({
-          missions: json.missions || [],
-          telemetryLogs: json.telemetryLogs || [],
-          harvestJobs: json.harvestJobs || [],
-        });
-      }
-    } catch (e) {
-      console.error("Failed to fetch mission history:", e);
+      if (!json.success) throw new Error(json.error || "Query database gagal.");
+      setData({
+        missions: json.missions || [],
+        telemetryLogs: json.telemetryLogs || [],
+        harvestJobs: json.harvestJobs || [],
+      });
+    } catch (e: any) {
+      if (e?.name === "AbortError") return;
+      console.error("Gagal memuat riwayat misi:", e);
+      setErrorMsg(e?.message || "Tidak bisa terhubung ke database.");
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     fetchHistory();
-  }, []);
+    return () => abortRef.current?.abort();
+  }, [fetchHistory]);
 
   return (
     <div className="glass-panel p-6 rounded-xl border flex flex-col gap-4">
@@ -50,6 +62,12 @@ export function MissionHistory() {
           <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} /> Refresh
         </button>
       </div>
+
+      {errorMsg && (
+        <div className="p-2.5 rounded-lg bg-red-500/10 border border-red-500/30 text-red-300 text-xs">
+          {errorMsg}
+        </div>
+      )}
 
       {/* Sub Tabs */}
       <div className="flex border-b border-slate-700/50 gap-4 text-xs font-semibold text-slate-400">

@@ -45,6 +45,19 @@
     </plugin>
     <plugin filename="gz-sim-imu-system"
             name="gz::sim::systems::Imu"/>
+    <!-- WAJIB: tanpa plugin ini sensor air_pressure pada model x500 tidak
+         pernah menghasilkan data, dan PX4 menolak arming dengan
+             "Preflight Fail: barometer 0 missing"
+         Karena EKF2 memakai barometer sebagai sumber altitude, ketiadaannya
+         juga memicu "ekf2 missing data" dan "heading estimate invalid".
+
+         World default PX4 (default.sdf) tidak mendeklarasikan plugin sama
+         sekali sehingga Gazebo memuat set default lengkap. Begitu sebuah world
+         mendeklarasikan plugin secara eksplisit — seperti world kustom ini —
+         Gazebo HANYA memuat yang didaftarkan, jadi setiap sistem sensor harus
+         disebut satu per satu. -->
+    <plugin filename="gz-sim-air-pressure-system"
+            name="gz::sim::systems::AirPressure"/>
     <plugin filename="gz-sim-magnetometer-system"
             name="gz::sim::systems::Magnetometer"/>
     <plugin filename="gz-sim-navsat-system"

@@ -1,14 +1,13 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
+import { useVehicleState } from "@/lib/useRos";
 import { Server, Wifi, Database, Cpu, Activity, CheckCircle2, XCircle } from "lucide-react";
 
 interface StatusState {
   rosbridge: boolean;
   fastapi: boolean;
   mysql: boolean;
-  xrceDds: boolean;
-  mavros: boolean;
 }
 
 export function SystemStatus({ rosConnected }: { rosConnected: boolean }) {
@@ -16,41 +15,57 @@ export function SystemStatus({ rosConnected }: { rosConnected: boolean }) {
     rosbridge: rosConnected,
     fastapi: false,
     mysql: false,
-    xrceDds: true,
-    mavros: true,
   });
+
+  // MAVROS dianggap hidup hanya kalau kita benar-benar menerima flight mode
+  // darinya. Sebelumnya nilai xrceDds & mavros di-hardcode `true`, sehingga
+  // panel selalu menampilkan "ONLINE" bahkan ketika autopilot mati total —
+  // indikator kesehatan yang justru menyesatkan operator.
+  const vehicle = useVehicleState();
+  const mavrosLive = rosConnected && vehicle.flightMode !== "UNKNOWN";
 
   useEffect(() => {
     setStatus((prev) => ({ ...prev, rosbridge: rosConnected }));
   }, [rosConnected]);
 
   useEffect(() => {
-    // Check FastAPI health endpoint
-    fetch("/api/ai/health")
-      .then((r) => r.json())
-      .then((data) => {
-        if (data.status === "ok" || data.environment) {
-          setStatus((prev) => ({ ...prev, fastapi: true }));
-        }
-      })
-      .catch(() => setStatus((prev) => ({ ...prev, fastapi: false })));
+    // AbortController + flag mounted: tanpa ini, respons fetch yang datang
+    // setelah komponen di-unmount (pindah tab) memanggil setState pada
+    // komponen mati — sumber warning React sekaligus kebocoran closure.
+    const controller = new AbortController();
+    let cancelled = false;
 
-    // Check MySQL health endpoint
-    fetch("/api/missions")
-      .then((r) => r.json())
-      .then((data) => {
-        if (data.success) {
-          setStatus((prev) => ({ ...prev, mysql: true }));
-        }
-      })
-      .catch(() => setStatus((prev) => ({ ...prev, mysql: false })));
+    const probe = async () => {
+      const [fastapi, mysql] = await Promise.all([
+        fetch("/api/ai/health", { signal: controller.signal })
+          .then((r) => (r.ok ? r.json() : null))
+          .then((data) => data?.status === "ok")
+          .catch(() => false),
+        fetch("/api/missions", { signal: controller.signal })
+          .then((r) => (r.ok ? r.json() : null))
+          .then((data) => Boolean(data?.success))
+          .catch(() => false),
+      ]);
+      if (cancelled) return;
+      setStatus((prev) => ({ ...prev, fastapi, mysql }));
+    };
+
+    probe();
+    // Health check berkala supaya panel tidak membeku pada hasil pertama.
+    const interval = setInterval(probe, 15_000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+      controller.abort();
+    };
   }, []);
 
   const items = [
     { name: "ROSBridge WebSocket", icon: Wifi, active: status.rosbridge, port: "9090", desc: "ROS 2 Topic & Service Gateway" },
     { name: "FastAPI AI Engine", icon: Server, active: status.fastapi, port: "8000", desc: "Rice Harvest & Geospatial REST API" },
-    { name: "Micro XRCE-DDS Agent", icon: Cpu, active: status.xrceDds, port: "8888", desc: "PX4 uORB High-Speed DDS Bridge" },
-    { name: "MAVROS Compatibility Layer", icon: Activity, active: status.mavros, port: "14540", desc: "MAVLink Arm/Takeoff Command Layer" },
+    { name: "Dashboard Bridge Node", icon: Cpu, active: status.rosbridge, port: "—", desc: "Telemetry 20Hz & Command Services" },
+    { name: "MAVROS / Autopilot", icon: Activity, active: mavrosLive, port: "14540", desc: `Flight mode: ${vehicle.flightMode}` },
     { name: "MySQL Database", icon: Database, active: status.mysql, port: "3306", desc: "Unified Telemetry & Mission Store" },
   ];
 

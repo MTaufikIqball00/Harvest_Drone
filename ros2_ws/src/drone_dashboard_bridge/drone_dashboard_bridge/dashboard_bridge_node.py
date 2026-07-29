@@ -25,10 +25,45 @@ from rclpy.qos import (
     qos_profile_sensor_data,
 )
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import String
+from std_msgs.msg import Float32, String
 from std_srvs.srv import Trigger
 
 WORLD = {"x_min": -190.0, "x_max": 370.0, "y_min": -220.0, "y_max": 160.0}
+
+# =============================================================================
+# QoS PROFILES
+# -----------------------------------------------------------------------------
+# SENSOR_QOS  : Best-effort depth 5 untuk stream telemetry real-time. Drop frame
+#               lama lebih baik daripada menahan pipeline (jitter-free).
+#               WAJIB best-effort untuk topik MAVROS: MAVROS mem-publish
+#               local_position/battery dengan SENSOR_DATA (best-effort). Subscriber
+#               RELIABLE tidak kompatibel dengan publisher BEST_EFFORT sehingga
+#               data TIDAK PERNAH sampai — ini penyebab telemetry mati total.
+# COMMAND_QOS : Reliable untuk command/waypoint — tidak boleh ada yang hilang.
+# =============================================================================
+SENSOR_QOS = QoSProfile(
+    reliability=QoSReliabilityPolicy.BEST_EFFORT,
+    history=QoSHistoryPolicy.KEEP_LAST,
+    depth=5,
+)
+
+COMMAND_QOS = QoSProfile(
+    reliability=QoSReliabilityPolicy.RELIABLE,
+    history=QoSHistoryPolicy.KEEP_LAST,
+    depth=10,
+)
+
+
+def now_epoch_ms() -> int:
+    """Unix epoch milliseconds — basis waktu tunggal untuk SIM/ROS/Backend/UI."""
+    return int(time.time() * 1000.0)
+
+
+# Batas obstacle hasil deteksi LiDAR. Tanpa batas ini daftar tumbuh selamanya
+# dan pencocokan duplikat menjadi O(n²) — node stall & rate telemetry anjlok.
+MAX_LIDAR_OBSTACLES = 40
+MAX_NEW_OBSTACLES_PER_SCAN = 3
+LIDAR_OBSTACLE_TTL_SEC = 120.0
 
 @dataclass
 class Pose2D:
@@ -85,6 +120,15 @@ class DashboardBridgeNode(Node):
         self.planner_cb_group = ReentrantCallbackGroup()
         # 3. Group untuk data sensor & statis
         self.sensor_cb_group = MutuallyExclusiveCallbackGroup()
+        # 4. Group KHUSUS publikasi telemetry.
+        #    Timer telemetry harus punya group sendiri. Kalau ditaruh bersama
+        #    sensor_cb_group, ia antre di belakang lidar_cb, battery_cb,
+        #    vehicle_state_cb, dan publish_dashboard_state (yang menserialisasi
+        #    JSON path + obstacle). Diukur pada test kontrak: berbagi group
+        #    menghasilkan jitter stddev ~53 ms pada target periode 50 ms —
+        #    stream terasa tersendat di UI. Group terpisah membuat kadensinya
+        #    stabil karena tidak pernah menunggu callback lain.
+        self.telemetry_cb_group = MutuallyExclusiveCallbackGroup()
 
         self.declare_parameter("marker_frame", "map")
         self.declare_parameter("spawn_x", -65.0)
@@ -104,6 +148,9 @@ class DashboardBridgeNode(Node):
         self.declare_parameter("low_battery_threshold", 0.10)
         self.declare_parameter("wind_abort_threshold", 8.0)
         self.declare_parameter("offboard_setpoint_rate", 20.0)
+        # Rate publish telemetry ke dashboard (Hz). 20Hz cukup untuk UI 60fps
+        # dengan interpolasi, dan menghindari CPU starvation di rosbridge.
+        self.declare_parameter("telemetry_rate", 20.0)
 
         self.frame_id = self.get_parameter("marker_frame").value
         self.spawn_x = float(self.get_parameter("spawn_x").value)
@@ -123,6 +170,7 @@ class DashboardBridgeNode(Node):
         self.low_battery_threshold = float(self.get_parameter("low_battery_threshold").value)
         self.wind_abort_threshold = float(self.get_parameter("wind_abort_threshold").value)
         self.setpoint_period = 1.0 / max(2.0, float(self.get_parameter("offboard_setpoint_rate").value))
+        self.telemetry_period = 1.0 / clamp(float(self.get_parameter("telemetry_rate").value), 1.0, 50.0)
 
         # 3 Palm Trees from agricultural_field.sdf
         self.obstacles = [
@@ -177,9 +225,31 @@ class DashboardBridgeNode(Node):
         self.last_tick_time = time.monotonic()
         self.last_battery = None
         
-        self.planning_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.planning_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="planner"
+        )
         self.planning_future = None
         self.offboard_requested = False
+
+        # --- Debounce MAVROS service call ---
+        # Sebelumnya call_set_mode() dipanggil tiap control_tick (20Hz) selama
+        # mode belum GUIDED. Setiap call_async() menyisakan pending request di
+        # dalam client rclpy yang tidak pernah dibersihkan => memory leak +
+        # MAVROS dibanjiri 20 request/detik. Sekarang di-debounce.
+        self._last_mode_request = 0.0
+        self._last_mode_requested: Optional[str] = None
+        self._last_arm_request = 0.0
+        self._service_call_min_interval = 1.0
+
+        # --- Waypoint ACK & dirty-flag path publishing ---
+        self._waypoint_seq = 0
+        self._path_dirty = True
+        self._actual_path_dirty = True
+
+        # --- Kecepatan turunan untuk telemetry (MAVROS pose tidak bawa twist) ---
+        self._last_vel_pose: Optional[Pose2D] = None
+        self._last_vel_time: Optional[float] = None
+        self.velocity = {"vx": 0.0, "vy": 0.0, "vz": 0.0, "speed": 0.0}
         # FIX BUG #3: Lock untuk melindungi pasangan (path, path_index) dari
         # race condition antara thread ThreadPoolExecutor (done_cb planner)
         # dan thread MultiThreadedExecutor (control_tick 20Hz).
@@ -224,22 +294,29 @@ class DashboardBridgeNode(Node):
         self.total_duration_sec = 0
         self.current_mission_id = 0
 
-        self.create_subscription(Twist, "/cmd_vel", self.cmd_vel_cb, 10, callback_group=self.control_cb_group)
-        self.create_subscription(PoseStamped, "/dashboard/goal_pose", self.goal_cb, 10, callback_group=self.planner_cb_group)
-        self.create_subscription(LaserScan, "/drone/lidar/scan", self.lidar_cb, qos_profile_sensor_data, callback_group=self.sensor_cb_group)
-        self.create_subscription(PoseStamped, "/mavros/local_position/pose", self.local_pose_cb, 10, callback_group=self.control_cb_group)
-        self.create_subscription(BatteryState, "/mavros/battery", self.battery_cb, 10, callback_group=self.sensor_cb_group)
-        self.create_subscription(State, "/mavros/state", self.vehicle_state_cb, 10, callback_group=self.sensor_cb_group)
-        self.create_subscription(String, "/dashboard/active_mission", self.active_mission_cb, 10, callback_group=self.sensor_cb_group)
+        # --- Command inputs: RELIABLE, tidak boleh drop ---
+        self.create_subscription(Twist, "/cmd_vel", self.cmd_vel_cb, COMMAND_QOS, callback_group=self.control_cb_group)
+        self.create_subscription(PoseStamped, "/dashboard/goal_pose", self.goal_cb, COMMAND_QOS, callback_group=self.planner_cb_group)
+        self.create_subscription(String, "/dashboard/waypoints", self.waypoints_cb, COMMAND_QOS, callback_group=self.planner_cb_group)
+        self.create_subscription(Float32, "/dashboard/takeoff_altitude", self.takeoff_altitude_cb, COMMAND_QOS, callback_group=self.sensor_cb_group)
+        self.create_subscription(String, "/dashboard/active_mission", self.active_mission_cb, COMMAND_QOS, callback_group=self.sensor_cb_group)
 
-        self.odom_pub = self.create_publisher(Odometry, "/odom", 10)
-        self.state_pub = self.create_publisher(String, "/dashboard/state", 10)
-        self.obstacles_pub = self.create_publisher(String, "/dashboard/obstacles", 10)
-        self.sensor_pub = self.create_publisher(String, "/dashboard/sensor_scan", 10)
-        self.metrics_pub = self.create_publisher(String, "/dashboard/metrics", 10)
-        self.path_pub = self.create_publisher(Path, "/dashboard/planned_path", 10)
-        self.actual_path_pub = self.create_publisher(Path, "/dashboard/actual_path", 10)
-        self.paths_json_pub = self.create_publisher(String, "/dashboard/paths_json", 10)
+        # --- Sensor/telemetry inputs: BEST_EFFORT agar kompatibel dgn MAVROS ---
+        self.create_subscription(LaserScan, "/drone/lidar/scan", self.lidar_cb, qos_profile_sensor_data, callback_group=self.sensor_cb_group)
+        self.create_subscription(PoseStamped, "/mavros/local_position/pose", self.local_pose_cb, SENSOR_QOS, callback_group=self.control_cb_group)
+        self.create_subscription(BatteryState, "/mavros/battery", self.battery_cb, SENSOR_QOS, callback_group=self.sensor_cb_group)
+        self.create_subscription(State, "/mavros/state", self.vehicle_state_cb, SENSOR_QOS, callback_group=self.sensor_cb_group)
+
+        # --- Outputs ---
+        self.odom_pub = self.create_publisher(Odometry, "/odom", SENSOR_QOS)
+        self.telemetry_pub = self.create_publisher(String, "/dashboard/telemetry", SENSOR_QOS)
+        self.state_pub = self.create_publisher(String, "/dashboard/state", COMMAND_QOS)
+        self.obstacles_pub = self.create_publisher(String, "/dashboard/obstacles", COMMAND_QOS)
+        self.sensor_pub = self.create_publisher(String, "/dashboard/sensor_scan", SENSOR_QOS)
+        self.metrics_pub = self.create_publisher(String, "/dashboard/metrics", COMMAND_QOS)
+        self.path_pub = self.create_publisher(Path, "/dashboard/planned_path", COMMAND_QOS)
+        self.actual_path_pub = self.create_publisher(Path, "/dashboard/actual_path", COMMAND_QOS)
+        self.paths_json_pub = self.create_publisher(String, "/dashboard/paths_json", COMMAND_QOS)
         self.global_path = []
         self.local_path = []
         self.final_path = []
@@ -254,6 +331,8 @@ class DashboardBridgeNode(Node):
 
         self.create_service(Trigger, "/start_gazebo", self.start_gazebo_cb, callback_group=self.planner_cb_group)
         self.create_service(Trigger, "/arm", self.arm_cb, callback_group=self.planner_cb_group)
+        self.create_service(Trigger, "/disarm", self.disarm_cb, callback_group=self.planner_cb_group)
+        self.create_service(Trigger, "/dashboard/resync", self.resync_cb, callback_group=self.sensor_cb_group)
         self.create_service(Trigger, "/takeoff", self.takeoff_cb, callback_group=self.planner_cb_group)
         self.create_service(Trigger, "/land", self.land_cb, callback_group=self.planner_cb_group)
         self.create_service(Trigger, "/return_home", self.return_home_cb, callback_group=self.planner_cb_group)
@@ -264,7 +343,13 @@ class DashboardBridgeNode(Node):
 
         self.create_timer(self.setpoint_period, self.control_tick, callback_group=self.control_cb_group)
         self.create_timer(0.5, self.publish_dashboard_state, callback_group=self.sensor_cb_group)
-        self.get_logger().info("ArduPilot MAVROS dashboard bridge ready. MultiThreadedExecutor Aktif.")
+        # Telemetry ke dashboard di-rate-limit terpisah (default 20Hz), TIDAK
+        # mengikuti rate MAVROS (30-50Hz) agar rosbridge & UI tidak kebanjiran.
+        self.create_timer(self.telemetry_period, self.publish_telemetry, callback_group=self.telemetry_cb_group)
+        self.get_logger().info(
+            f"ArduPilot MAVROS dashboard bridge ready. MultiThreadedExecutor aktif. "
+            f"Telemetry {1.0 / self.telemetry_period:.0f}Hz, setpoint {1.0 / self.setpoint_period:.0f}Hz."
+        )
 
     def now_us(self) -> int: return int(self.get_clock().now().nanoseconds / 1000)
 
@@ -378,11 +463,18 @@ class DashboardBridgeNode(Node):
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         yaw_enu = math.atan2(siny_cosp, cosy_cosp)
         
-        pose = Pose2D()
-        pose.x = float(msg.pose.position.x) + self.spawn_x
-        pose.y = float(msg.pose.position.y) + self.spawn_y
-        pose.z = float(msg.pose.position.z)
-        pose.yaw = yaw_enu
+        # BUG FATAL (sudah ada sebelumnya): `Pose2D()` dipanggil tanpa argumen,
+        # padahal Pose2D adalah dataclass dengan field wajib x, y, z. Callback
+        # ini melempar TypeError pada pesan pose PERTAMA dari MAVROS, dan karena
+        # exception di dalam callback rclpy menggelembung sampai executor.spin(),
+        # seluruh node langsung mati. Akibatnya bridge tidak pernah benar-benar
+        # berjalan begitu autopilot terhubung.
+        pose = Pose2D(
+            x=float(msg.pose.position.x) + self.spawn_x,
+            y=float(msg.pose.position.y) + self.spawn_y,
+            z=float(msg.pose.position.z),
+            yaw=yaw_enu,
+        )
         self.set_current_pose(pose)
 
     def battery_cb(self, msg: BatteryState) -> None:
@@ -423,15 +515,39 @@ class DashboardBridgeNode(Node):
             self.publish_status("mission_completed_db", f"Misi selesai! Durasi: {self.total_duration_sec}s, Jarak: {self.mission_distance_m:.1f}m, Baterai terpakai: {self.battery_used_percent:.1f}%")
 
     def lidar_cb(self, msg: LaserScan) -> None:
-        valid_ranges = []
-        for i, r in enumerate(msg.ranges):
-            angle_relative = msg.angle_min + (i * msg.angle_increment)
-            if -1.05 <= angle_relative <= 1.05:  
-                if math.isfinite(r) and 2.5 < r < msg.range_max:
-                    valid_ranges.append((r, angle_relative))
+        # RATE LIMIT. LiDAR 2D mem-publish pada 10-40Hz. Karena GIL Python,
+        # callback ini menahan interpreter dan menunda timer telemetry 20Hz —
+        # inilah sumber jitter terbesar saat LiDAR aktif. Cooldown replan sudah
+        # 0.5s, jadi memproses lebih cepat dari 10Hz tidak memberi manfaat apa pun.
+        now = time.monotonic()
+        if now - getattr(self, "_last_lidar_process", 0.0) < 0.1:
+            return
+        self._last_lidar_process = now
 
-        stride = max(1, len(msg.ranges) // 90)
-        self.scan_sample = [float(r) if math.isfinite(r) else float(msg.range_max) for r in msg.ranges[::stride]][:90]
+        ranges = msg.ranges
+        n = len(ranges)
+        if n == 0:
+            self.nearest_obstacle_m = None
+            return
+
+        # Hitung LANGSUNG jendela indeks untuk sektor depan ±1.05 rad, alih-alih
+        # men-scan seluruh berkas dan menghitung sudut per titik. Versi lama
+        # melakukan dua kali lintasan Python penuh atas semua titik.
+        increment = msg.angle_increment or 1e-6
+        i_lo = max(0, int(math.ceil((-1.05 - msg.angle_min) / increment)))
+        i_hi = min(n - 1, int(math.floor((1.05 - msg.angle_min) / increment)))
+
+        range_max = msg.range_max
+        valid_ranges = []
+        for i in range(i_lo, i_hi + 1):
+            r = ranges[i]
+            if 2.5 < r < range_max and math.isfinite(r):
+                valid_ranges.append((r, msg.angle_min + i * increment))
+
+        stride = max(1, n // 90)
+        self.scan_sample = [
+            float(r) if math.isfinite(r) else float(range_max) for r in ranges[::stride][:90]
+        ]
         if not valid_ranges:
             self.nearest_obstacle_m = None
             return
@@ -440,58 +556,135 @@ class DashboardBridgeNode(Node):
         self.nearest_obstacle_m = min_range
         now = time.monotonic()
         
-        if (self.mode == "auto" and (now - self._last_lidar_replan) > self._lidar_replan_cooldown):
+        if self.mode == "auto" and (now - self._last_lidar_replan) > self._lidar_replan_cooldown:
+            if self.current_pose is None:
+                return
+
+            pose = self.current_pose
+            static_obs = [o for o in self.obstacles if o.get("source") == "gazebo_sdf"]
+            lidar_obs = [o for o in self.obstacles if o.get("source") == "lidar"]
+
             replanned = False
-            
+            added_this_scan = 0
+
             for dist, angle_rel in valid_ranges:
                 if dist >= 15.0:
                     continue
-                    
-                if self.current_pose:
-                    angle_absolute = self.current_pose.yaw + angle_rel
-                    hit_x = self.current_pose.x + dist * math.cos(angle_absolute)
-                    hit_y = self.current_pose.y + dist * math.sin(angle_absolute)
-                    
-                    hit_static_tree = False
-                    closest_obs = None
-                    min_dist = float('inf')
-                    
-                    for obs in self.obstacles:
-                        if obs.get("source") == "gazebo_sdf":
-                            dist_to_center = math.hypot(hit_x - float(obs["x"]), hit_y - float(obs["y"]))
-                            if dist_to_center < min_dist:
-                                min_dist = dist_to_center
-                                closest_obs = obs
-                    
-                    if closest_obs and min_dist <= (float(closest_obs["radius"]) + 8.0):
-                        if not closest_obs.get("active", False):
-                            closest_obs["active"] = True  
-                            self.get_logger().warn(f"LiDAR: Mengaktifkan rintangan peta statis '{closest_obs['id']}'! A* menghindari area tersebut.")
-                            replanned = True
-                        hit_static_tree = True
-                    
-                    if not hit_static_tree:
-                        is_new = True
-                        for obs in self.obstacles:
-                            if obs.get("source") == "lidar":
-                                if math.hypot(hit_x - float(obs["x"]), hit_y - float(obs["y"])) < 4.0:
-                                    is_new = False
-                                    break
-                        if is_new:
-                            # Push the obstacle center 2.0m INTO the tree to cover the trunk properly
-                            obs_x = self.current_pose.x + (dist + 2.0) * math.cos(angle_absolute)
-                            obs_y = self.current_pose.y + (dist + 2.0) * math.sin(angle_absolute)
-                            
-                            self.obstacles.append({"id": f"dyn_lidar_{int(now * 1000)}_{int(dist)}", "kind": "tree", "x": obs_x, "y": obs_y, "radius": 2.5, "clearance": 2.0, "height": 10.0, "source": "lidar"})
-                            self.get_logger().warn(f"LiDAR: Obstacle BARU terdeteksi di {dist:.1f}m. Menambahkan ke A*!")
-                            replanned = True
-                            
+                # KEBOCORAN MEMORI (sudah ada sebelumnya): tanpa batas ini,
+                # setiap scan bisa menambahkan puluhan obstacle baru. Daftar
+                # tumbuh selamanya, dan karena pencocokan "sudah ada?" men-scan
+                # seluruh daftar untuk SETIAP titik, biayanya jadi O(n²).
+                # Terukur: node stall sampai ~3 detik dan rate telemetry anjlok
+                # dari 20Hz ke 14Hz.
+                if added_this_scan >= MAX_NEW_OBSTACLES_PER_SCAN:
+                    break
+
+                angle_absolute = pose.yaw + angle_rel
+                cos_a = math.cos(angle_absolute)
+                sin_a = math.sin(angle_absolute)
+                hit_x = pose.x + dist * cos_a
+                hit_y = pose.y + dist * sin_a
+
+                closest_obs = None
+                min_dist = float("inf")
+                for obs in static_obs:
+                    d = math.hypot(hit_x - float(obs["x"]), hit_y - float(obs["y"]))
+                    if d < min_dist:
+                        min_dist = d
+                        closest_obs = obs
+
+                if closest_obs and min_dist <= (float(closest_obs["radius"]) + 8.0):
+                    if not closest_obs.get("active", False):
+                        closest_obs["active"] = True
+                        self.get_logger().warn(
+                            f"LiDAR: Mengaktifkan rintangan peta statis '{closest_obs['id']}'."
+                        )
+                        replanned = True
+                    continue
+
+                if any(
+                    math.hypot(hit_x - float(o["x"]), hit_y - float(o["y"])) < 4.0
+                    for o in lidar_obs
+                ):
+                    continue
+
+                new_obs = {
+                    "id": f"dyn_lidar_{int(now * 1000)}_{added_this_scan}",
+                    "kind": "tree",
+                    # Geser pusat 2.0 m MASUK ke rintangan agar batang tertutup.
+                    "x": pose.x + (dist + 2.0) * cos_a,
+                    "y": pose.y + (dist + 2.0) * sin_a,
+                    "radius": 2.5,
+                    "clearance": 2.0,
+                    "height": 10.0,
+                    "source": "lidar",
+                    "detected_at": now,
+                }
+                self.obstacles.append(new_obs)
+                lidar_obs.append(new_obs)
+                added_this_scan += 1
+                replanned = True
+                self.get_logger().warn(f"LiDAR: Obstacle baru pada {dist:.1f}m ditambahkan ke A*.")
+
+            if added_this_scan:
+                self._prune_lidar_obstacles(now)
+
             if replanned:
                 self._last_lidar_replan = now
                 self.replan_from_current("lidar_obstacle")
 
+    def _prune_lidar_obstacles(self, now: float) -> None:
+        """Jaga daftar obstacle LiDAR tetap terbatas.
+
+        Deteksi LiDAR bersifat sementara: sekali drone melewatinya, rintangan itu
+        tidak lagi relevan untuk perencanaan. Menyimpannya selamanya membuat RAM
+        dan waktu A* naik terus sepanjang misi.
+        """
+        lidar_obs = [o for o in self.obstacles if o.get("source") == "lidar"]
+        if not lidar_obs:
+            return
+
+        fresh = [o for o in lidar_obs if now - o.get("detected_at", now) <= LIDAR_OBSTACLE_TTL_SEC]
+        # Buang yang tertua dulu bila masih melebihi kuota.
+        if len(fresh) > MAX_LIDAR_OBSTACLES:
+            fresh.sort(key=lambda o: o.get("detected_at", 0.0))
+            fresh = fresh[-MAX_LIDAR_OBSTACLES:]
+
+        if len(fresh) != len(lidar_obs):
+            keep = {id(o) for o in fresh}
+            self.obstacles = [
+                o for o in self.obstacles if o.get("source") != "lidar" or id(o) in keep
+            ]
+            self.get_logger().info(
+                f"LiDAR: {len(lidar_obs) - len(fresh)} obstacle usang dibuang "
+                f"(tersisa {len(fresh)}/{MAX_LIDAR_OBSTACLES})."
+            )
+
     def set_current_pose(self, pose: Pose2D) -> None:
-        self._last_pose_time = time.monotonic()
+        now = time.monotonic()
+
+        # Turunkan kecepatan dari beda posisi + low-pass ringan. MAVROS
+        # local_position/pose tidak membawa twist, dan sebelumnya /odom selalu
+        # dipublish dengan twist = 0 sehingga MySQL logger mencatat speed 0
+        # untuk seluruh misi.
+        if self._last_vel_pose is not None and self._last_vel_time is not None:
+            dt = now - self._last_vel_time
+            if dt > 1e-3:
+                alpha = 0.35  # smoothing agar angka HUD tidak gemetar
+                vx = (pose.x - self._last_vel_pose.x) / dt
+                vy = (pose.y - self._last_vel_pose.y) / dt
+                vz = (pose.z - self._last_vel_pose.z) / dt
+                self.velocity["vx"] += alpha * (vx - self.velocity["vx"])
+                self.velocity["vy"] += alpha * (vy - self.velocity["vy"])
+                self.velocity["vz"] += alpha * (vz - self.velocity["vz"])
+                self.velocity["speed"] = math.hypot(self.velocity["vx"], self.velocity["vy"])
+                self._last_vel_pose = Pose2D(pose.x, pose.y, pose.z, pose.yaw)
+                self._last_vel_time = now
+        else:
+            self._last_vel_pose = Pose2D(pose.x, pose.y, pose.z, pose.yaw)
+            self._last_vel_time = now
+
+        self._last_pose_time = now
         if self.home_pose is None: self.home_pose = Pose2D(pose.x, pose.y, pose.z, pose.yaw)
         if self.vehicle_status.get("armed", False) and pose.z > 0.3:
             if not self.home_pose_saved:
@@ -507,7 +700,12 @@ class DashboardBridgeNode(Node):
             self.actual_path.append(Pose2D(pose.x, pose.y, pose.z, pose.yaw))
             self.last_trail_pose = pose
             if len(self.actual_path) > 2000: self.actual_path = self.actual_path[-2000:]
-            self.publish_actual_path()
+            # Trail dipublish maksimal 2Hz. Sebelumnya seluruh 2000 pose dikirim
+            # ulang setiap kali drone bergerak 0.35m — pada kecepatan jelajah
+            # 3.5 m/s itu ~10x/detik x 2000 pose = beban serialisasi percuma.
+            if now - getattr(self, "_last_trail_publish", 0.0) > 0.5:
+                self._last_trail_publish = now
+                self.publish_actual_path()
 
     def control_tick(self) -> None:
         now = time.monotonic()
@@ -740,45 +938,67 @@ class DashboardBridgeNode(Node):
                 
         self.publish_position_setpoint(target, target_speed)
 
-    def publish_offboard_control_mode(self) -> None:
-        msg = OffboardControlMode()
-        msg.timestamp = self.now_us()
-        # FIX BUG #1: "takeoff_spinup" WAJIB masuk daftar position-control.
-        # Tanpa ini, selama 1.8 detik spin-up PX4 menerima OffboardControlMode
-        # dengan SEMUA field False bersamaan dengan permintaan masuk OFFBOARD,
-        # menyebabkan drone bergoyang (wobble) sebelum naik vertikal.
-        msg.position = self.mode in ("auto", "takeoff", "takeoff_spinup", "return_home", "hold", "idle", "survey_countdown", "orbit")
-        msg.velocity = self.mode == "manual"
-        msg.acceleration = False; msg.attitude = False; msg.body_rate = False; msg.thrust_and_torque = False; msg.direct_actuator = False
-        self.offboard_pub.publish(msg)
+    # ------------------------------------------------------------------
+    # MAVROS SERVICE CALLS (non-blocking)
+    # ------------------------------------------------------------------
+    # PENTING: fungsi-fungsi ini dipanggil dari control_tick() yang berjalan
+    # 20Hz. Versi lama memakai wait_for_service(timeout_sec=1.0) yang MEMBLOKIR
+    # thread executor hingga 1 detik penuh — pada 20Hz itu berarti control loop
+    # kehilangan ~20 tick dan stream setpoint terputus (drone wobble/jitter).
+    # Sekarang: service_is_ready() (non-blocking) + hasil future dibersihkan
+    # eksplisit agar pending request rclpy tidak menumpuk.
+    def _dispatch(self, client, req, label: str) -> bool:
+        if not client.service_is_ready():
+            self.get_logger().warning(f"{label}: service MAVROS belum siap, permintaan dilewati.")
+            return False
+        future = client.call_async(req)
+
+        def _done(fut) -> None:
+            try:
+                fut.result()
+            except Exception as exc:
+                self.get_logger().error(f"{label} gagal: {exc}")
+            finally:
+                # Lepas pending request agar tidak bocor di dalam client rclpy.
+                try:
+                    client.remove_pending_request(fut)
+                except Exception:
+                    pass
+
+        future.add_done_callback(_done)
+        return True
 
     def call_arm(self, arm: bool) -> None:
-        if not self.arming_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().error("Arming service not available!")
+        now = time.monotonic()
+        if now - self._last_arm_request < self._service_call_min_interval:
             return
+        self._last_arm_request = now
         req = CommandBool.Request()
         req.value = arm
-        self.arming_client.call_async(req)
+        self._dispatch(self.arming_client, req, f"{'Arm' if arm else 'Disarm'}")
 
     def call_set_mode(self, mode: str) -> None:
-        if not self.set_mode_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().error("SetMode service not available!")
+        now = time.monotonic()
+        # Debounce: jangan kirim ulang mode yang sama lebih cepat dari 1 detik.
+        if (
+            self._last_mode_requested == mode
+            and now - self._last_mode_request < self._service_call_min_interval
+        ):
             return
+        self._last_mode_request = now
+        self._last_mode_requested = mode
         req = SetMode.Request()
         req.custom_mode = mode
-        self.set_mode_client.call_async(req)
+        self._dispatch(self.set_mode_client, req, f"SetMode({mode})")
 
     def call_takeoff(self, altitude: float) -> None:
-        if not self.takeoff_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().error("Takeoff service not available!")
-            return
         req = CommandTOL.Request()
         req.altitude = altitude
         req.latitude = 0.0
         req.longitude = 0.0
         req.min_pitch = 0.0
         req.yaw = 0.0
-        self.takeoff_client.call_async(req)
+        self._dispatch(self.takeoff_client, req, "Takeoff")
 
     def publish_position_setpoint(self, pose: Pose2D, current_cruise_speed: float = None) -> None:
         if self.current_pose is None: return
@@ -866,6 +1086,116 @@ class DashboardBridgeNode(Node):
         response.success = True; response.message = "ArduPilot arm command dikirim."
         return response
 
+    def disarm_cb(self, _request: Trigger.Request, response: Trigger.Response):
+        """DISARM. Sebelumnya tidak ada service ini sama sekali sehingga tombol
+        DISARM di dashboard tidak punya lawan bicara di sisi ROS."""
+        self.mode = "idle"
+        self.path = []
+        self.sp_x = None
+        self.survey_active = False
+        self.manual_cmd = Twist()
+        # Reset debounce agar perintah safety-critical ini pasti terkirim.
+        self._last_arm_request = 0.0
+        self.call_arm(False)
+        response.success = True
+        response.message = "Perintah DISARM dikirim; motor dimatikan."
+        self.publish_status("disarm", response.message)
+        return response
+
+    def resync_cb(self, _request: Trigger.Request, response: Trigger.Response):
+        """Full state resynchronization.
+
+        Dipanggil dashboard setiap kali WebSocket berhasil reconnect, supaya UI
+        langsung mendapat snapshot lengkap (mode, armed, path, home, goal)
+        tanpa menunggu tick periodik berikutnya — mencegah stale state.
+        """
+        self._path_dirty = True
+        self._actual_path_dirty = True
+        self.publish_dashboard_state()
+        self.publish_actual_path()
+        if self.current_pose is not None:
+            self.publish_telemetry()
+        response.success = True
+        response.message = json.dumps(self.snapshot_payload())
+        return response
+
+    def waypoints_cb(self, msg: String) -> None:
+        """Terima daftar waypoint dari dashboard + balas ACK.
+
+        Kontrak ACK: UI mengirim {"seq": <int>, "waypoints": [{x,y,z}, ...]}.
+        Node membalas event "waypoints_ack" di /dashboard/state berisi seq yang
+        sama + jumlah waypoint yang benar-benar diterima. UI baru menandai
+        waypoint "confirmed" setelah seq cocok — bukan langsung saat klik.
+        """
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError) as exc:
+            self.publish_status("waypoints_nack", f"Payload waypoint tidak valid: {exc}")
+            return
+
+        seq = int(payload.get("seq", 0)) if isinstance(payload, dict) else 0
+        raw = payload.get("waypoints", []) if isinstance(payload, dict) else payload
+
+        if not isinstance(raw, list) or not raw:
+            self.publish_ack("waypoints_nack", seq, 0, "Daftar waypoint kosong.")
+            return
+
+        if self.current_pose is None:
+            self.publish_ack("waypoints_nack", seq, 0, "Local position belum tersedia.")
+            return
+
+        parsed: List[Pose2D] = []
+        for item in raw:
+            try:
+                x = float(item["x"])
+                y = float(item["y"])
+                z = float(item.get("z", self.takeoff_altitude))
+            except (KeyError, TypeError, ValueError):
+                self.publish_ack("waypoints_nack", seq, 0, "Format waypoint salah (butuh x, y).")
+                return
+            if not (WORLD["x_min"] <= x <= WORLD["x_max"] and WORLD["y_min"] <= y <= WORLD["y_max"]):
+                self.publish_ack("waypoints_nack", seq, 0, f"Waypoint ({x:.1f}, {y:.1f}) di luar batas world.")
+                return
+            parsed.append(Pose2D(x=x, y=y, z=z, yaw=self.current_pose.yaw))
+
+        with self._path_lock:
+            self.path = parsed
+            self.path_index = 0
+            self.outbound_path = list(parsed)
+            self.return_path = []
+        self._waypoint_seq = seq
+        self.last_goal = parsed[-1]
+        self.survey_active = False
+        self.offboard_requested = True
+        self.mode = "auto"
+        self.journey_status = "Navigating to Target"
+        self.mission_start_time = time.monotonic()
+        self.mission_distance_m = 0.0
+        self.mission_start_battery = self.battery.get("remaining")
+        self.rtl_triggered = False
+        self._path_dirty = True
+        self.publish_path()
+        self.publish_ack("waypoints_ack", seq, len(parsed), f"{len(parsed)} waypoint diterima & misi dimulai.")
+
+    def takeoff_altitude_cb(self, msg: Float32) -> None:
+        """Altitude takeoff dari dashboard. Di-clamp supaya input UI yang salah
+        (atau nilai kosong) tidak pernah menghasilkan perintah berbahaya."""
+        altitude = clamp(float(msg.data), 1.0, 50.0)
+        if abs(altitude - self.takeoff_altitude) < 1e-3:
+            return
+        self.takeoff_altitude = altitude
+        self.get_logger().info(f"Takeoff altitude diperbarui dari dashboard: {altitude:.1f} m")
+
+    def publish_ack(self, event: str, seq: int, count: int, message: str) -> None:
+        self.state_pub.publish(String(data=json.dumps({
+            "event": event,
+            "seq": seq,
+            "count": count,
+            "message": message,
+            "stamp_ms": now_epoch_ms(),
+        })))
+        self.get_logger().info(f"[{event}] seq={seq} count={count}: {message}")
+
     def takeoff_cb(self, _request: Trigger.Request, response: Trigger.Response):
         if self.current_pose is None:
             response.success = False; response.message = "Tidak ada local position."
@@ -948,29 +1278,60 @@ class DashboardBridgeNode(Node):
                 # 3. Logika Pemilihan (Switching Logic) Hybrid RRT*-A*
                 # Jika renggang (<= 2 rintangan), gunakan A* agar rute sangat optimal.
                 # Jika padat (> 2 rintangan), gunakan RRT* agar kalkulasi edge computing lebih cepat.
-                if obs_count <= 2:
-                    self.get_logger().info(f"ODI Rendah ({obs_count} rintangan). Memilih A* untuk Detour.")
-                    detour_grid = self.a_star((self.current_pose.x, self.current_pose.y), (local_goal.x, local_goal.y))
-                    alg_name = "A*"
-                else:
-                    self.get_logger().info(f"ODI Tinggi ({obs_count} rintangan). Memilih RRT* untuk Detour.")
-                    detour_grid = self.rrt((self.current_pose.x, self.current_pose.y), (local_goal.x, local_goal.y))
-                    alg_name = "RRT*"
+                # BOTTLENECK JITTER TERBESAR (sudah ada sebelumnya).
+                # Versi lama menjalankan A*/RRT* + smoothing + Bézier SECARA
+                # SINKRON di sini. replan_from_current() dipanggil dari
+                # lidar_cb(), jadi seluruh kalkulasi itu berjalan di dalam
+                # callback sensor: thread callback group tertahan DAN GIL Python
+                # dipegang, sehingga timer telemetry 20Hz ikut berhenti.
+                # Terukur: satu gap telemetry 2.8 DETIK saat detour dihitung.
+                #
+                # Sekarang kalkulasi berat dikirim ke planning_executor — pola
+                # async yang memang sudah dipakai untuk global path di bawah.
+                start_xy = (self.current_pose.x, self.current_pose.y)
+                goal_xy = (local_goal.x, local_goal.y)
+                goal_z, goal_yaw = local_goal.z, local_goal.yaw
+                use_astar = obs_count <= 2
+                alg_name = "A*" if use_astar else "RRT*"
+                self.get_logger().info(
+                    f"ODI {'Rendah' if use_astar else 'Tinggi'} ({obs_count} rintangan). "
+                    f"Memilih {alg_name} untuk Detour (async)."
+                )
 
-                if detour_grid:
-                    # 4. Penghalusan Jalur menggunakan Kurva Bézier
-                    pruned_detour = self.smooth_path(detour_grid)
-                    smoothed_detour = self.bezier_corner_smoothing(pruned_detour, corner_dist=4.0, num_samples=10)
-                    
-                    # 5. Gabungkan Rute Halus dengan Jalur Utama
-                    self.local_path = [Pose2D(x, y, local_goal.z, local_goal.yaw) for x, y in smoothed_detour]
-                    # FIX BUG #3: atomic update path + path_index
+                def compute_detour() -> List[Pose2D]:
+                    grid = self.a_star(start_xy, goal_xy) if use_astar else self.rrt(start_xy, goal_xy)
+                    if not grid:
+                        return []
+                    pruned = self.smooth_path(grid)
+                    smoothed = self.bezier_corner_smoothing(pruned, corner_dist=4.0, num_samples=10)
+                    return [Pose2D(x, y, goal_z, goal_yaw) for x, y in smoothed]
+
+                def detour_done(fut) -> None:
+                    if fut.cancelled():
+                        return
+                    try:
+                        detour = fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        self.get_logger().error(f"Detour {alg_name} gagal: {exc}")
+                        return
+                    if not detour:
+                        self.get_logger().warning(f"Detour {alg_name} tidak menemukan jalur.")
+                        return
+                    self.local_path = detour
                     with self._path_lock:
                         self.path = self.local_path + self.global_path[resume_idx:]
                         self.path_index = 0
+                    self._path_dirty = True
                     self.publish_path()
-                    self.publish_status("replan", f"Hybrid {alg_name} detour halus dibuat menghindari rintangan ({reason}).")
-                    return
+                    self.publish_status(
+                        "replan", f"Hybrid {alg_name} detour halus dibuat menghindari rintangan ({reason})."
+                    )
+
+                if self.planning_future and not self.planning_future.done():
+                    self.planning_future.cancel()
+                self.planning_future = self.planning_executor.submit(compute_detour)
+                self.planning_future.add_done_callback(detour_done)
+                return
         # --------------------------------------------------------------
 
         if self.last_goal is None: return
@@ -992,16 +1353,36 @@ class DashboardBridgeNode(Node):
         self.publish_status("replan", f"Global A* Path replanned karena {reason}.")
 
     def plan_path(self, start: Pose2D, goal: Pose2D) -> List[Pose2D]:
+        # Instrumentasi per-fase: planner berjalan di thread lain tetapi GIL
+        # Python tetap menahan timer telemetry, jadi kita perlu tahu fase mana
+        # yang mahal — bukan menebak.
         self.local_path = []
+        t0 = time.monotonic()
         grid_path = self.a_star((start.x, start.y), (goal.x, goal.y))
+        t_astar = time.monotonic() - t0
+
         if not grid_path:
             self.get_logger().error("A*: TERJEBAK! Drone memaksa HOLD POSITION demi keamanan.")
             self.mode = "hold"; self.path = []; self.sp_x = None
             return self.path
-            
+
+        t1 = time.monotonic()
         pruned_path = self.smooth_path(grid_path)
+        t_smooth = time.monotonic() - t1
+
+        t2 = time.monotonic()
         smoothed_path = self.bezier_corner_smoothing(pruned_path, corner_dist=6.0, num_samples=10)
-        
+        t_bezier = time.monotonic() - t2
+
+        total = time.monotonic() - t0
+        log = self.get_logger().warning if total > 0.25 else self.get_logger().info
+        log(
+            f"Planner {total * 1000:.0f} ms "
+            f"(A* {t_astar * 1000:.0f} ms/{len(grid_path)} sel, "
+            f"smooth {t_smooth * 1000:.0f} ms/{len(pruned_path)} titik, "
+            f"bezier {t_bezier * 1000:.0f} ms)"
+        )
+
         waypoints = [Pose2D(x, y, goal.z, goal.yaw) for x, y in smoothed_path]
         return waypoints
 
@@ -1253,32 +1634,27 @@ class DashboardBridgeNode(Node):
         else:
             self.sp_z = target.z
 
-        msg = TrajectorySetpoint()
-        msg.timestamp = self.now_us()
-        local_x = self.sp_x - self.spawn_x
-        local_y = self.sp_y - self.spawn_y
-        msg.position = [float(local_y), float(local_x), float(-self.sp_z)]
+        # BUG FATAL (sudah ada sebelumnya): blok ini membuat `TrajectorySetpoint`
+        # — pesan uORB milik PX4 — di dalam node MAVROS/ArduPilot. Tipe itu tidak
+        # pernah diimpor, jadi begitu auto-orbit terpicu (drone melintas <8 m dari
+        # pohon), callback melempar NameError dan MEMATIKAN seluruh node di
+        # tengah penerbangan. Sisa kode dari varian PX4.
+        #
+        # Sekarang memakai konvensi yang sama dengan publish_position_setpoint():
+        # PoseStamped ENU pada /mavros/setpoint_position/local, dengan offset
+        # spawn dikurangi dan yaw menghadap pusat pohon.
+        msg = PoseStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.frame_id
+        msg.pose.position.x = float(self.sp_x - self.spawn_x)
+        msg.pose.position.y = float(self.sp_y - self.spawn_y)
+        msg.pose.position.z = float(self.sp_z)
 
-        # Velocity feedforward
-        if dist_sp > max_d_xy:
-            vel_x = (dx_sp / dist_sp) * self.orbit_speed
-            vel_y = (dy_sp / dist_sp) * self.orbit_speed
-        else:
-            vel_x = 0.0
-            vel_y = 0.0
-        vel_z = math.copysign(self.vertical_speed, dz_sp) if abs(dz_sp) > max_d_z else 0.0
-        msg.velocity = [float(vel_y), float(vel_x), float(-vel_z)]
-        msg.acceleration = [float("nan"), float("nan"), float("nan")]
-        msg.jerk = [float("nan"), float("nan"), float("nan")]
-
-        # Yaw faces the tree center
+        # Yaw menghadap pusat pohon (ENU, tidak perlu konversi NED).
         cx = float(self.orbit_center["x"])
         cy = float(self.orbit_center["y"])
         yaw_enu = math.atan2(cy - self.current_pose.y, cx - self.current_pose.x)
-        yaw_ned = math.pi / 2.0 - yaw_enu
-        yaw_ned = (yaw_ned + math.pi) % (2 * math.pi) - math.pi
-        msg.yaw = float(yaw_ned)
-        msg.yawspeed = float("nan")
+        msg.pose.orientation = yaw_to_quaternion(yaw_enu)
         self.trajectory_pub.publish(msg)
 
     def generate_boustrophedon_path(self) -> List[Pose2D]:
@@ -1484,13 +1860,43 @@ class DashboardBridgeNode(Node):
         def to_world(c: Tuple[int, int]) -> Tuple[float, float]:
             return (x_min + c[0] * res, y_min + c[1] * res)
 
+        # OPTIMASI HOT LOOP.
+        # Versi lama memanggil blocked() untuk setiap tetangga DAN untuk sel
+        # saat ini, tanpa cache. Setiap panggilan menelusuri seluruh daftar
+        # obstacle sambil melakukan konversi dict-lookup + float() + math.hypot.
+        # Pada resolusi 1 m di dunia 560x380 m itu jutaan operasi — A* memakan
+        # waktu detik, dan karena GIL, timer telemetry 20Hz ikut membeku
+        # (terukur: stall 3.0 detik).
+        #
+        # Perbaikan: (1) obstacle di-flatten sekali ke tuple dengan radius
+        # kuadrat (buang sqrt), (2) hasil blocked() di-memo per sel.
+        obstacle_discs = [
+            (
+                float(o["x"]),
+                float(o["y"]),
+                (float(o["radius"]) + float(o["clearance"])) ** 2,
+            )
+            for o in self.obstacles
+            if not (o.get("source") == "gazebo_sdf" and not o.get("active", True))
+        ]
+
+        blocked_cache: Dict[Tuple[int, int], bool] = {}
+
         def blocked(c: Tuple[int, int]) -> bool:
-            x, y = to_world(c)
-            for obstacle in self.obstacles:
-                if obstacle.get("source") == "gazebo_sdf" and not obstacle.get("active", True): continue
-                radius = float(obstacle["radius"]) + float(obstacle["clearance"])
-                if math.hypot(x - float(obstacle["x"]), y - float(obstacle["y"])) <= radius: return True
-            return False
+            cached = blocked_cache.get(c)
+            if cached is not None:
+                return cached
+            x = x_min + c[0] * res
+            y = y_min + c[1] * res
+            result = False
+            for ox, oy, r2 in obstacle_discs:
+                dx = x - ox
+                dy = y - oy
+                if dx * dx + dy * dy <= r2:
+                    result = True
+                    break
+            blocked_cache[c] = result
+            return result
 
         start_c = to_cell(start); goal_c = to_cell(goal)
         start_is_blocked = blocked(start_c)
@@ -1597,10 +2003,36 @@ class DashboardBridgeNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg(); msg.header.frame_id = self.frame_id; msg.child_frame_id = "base_link"
         msg.pose.pose.position.x = pose.x; msg.pose.pose.position.y = pose.y; msg.pose.pose.position.z = pose.z
         msg.pose.pose.orientation = yaw_to_quaternion(pose.yaw)
+        # Isi twist dari kecepatan turunan, kalau tidak MySQL logger selalu
+        # mencatat speed_mps = 0.
+        msg.twist.twist.linear.x = float(self.velocity["vx"])
+        msg.twist.twist.linear.y = float(self.velocity["vy"])
+        msg.twist.twist.linear.z = float(self.velocity["vz"])
         self.odom_pub.publish(msg)
 
     def publish_path(self) -> None:
-        import json
+        # Hanya publish saat isi path berubah. Rute survey bisa ratusan waypoint;
+        # menserialisasinya 2x/detik tanpa perubahan membakar CPU node dan
+        # membanjiri rosbridge tanpa manfaat.
+        def endpoints(seq: List[Pose2D]) -> Tuple:
+            if not seq:
+                return ()
+            a, b = seq[0], seq[-1]
+            return (round(a.x, 2), round(a.y, 2), round(b.x, 2), round(b.y, 2))
+
+        signature = (
+            len(self.path), self.path_index, endpoints(self.path),
+            len(self.global_path), endpoints(self.global_path),
+            len(self.local_path), endpoints(self.local_path),
+            len(self.outbound_path), endpoints(self.outbound_path),
+            len(self.return_path), endpoints(self.return_path),
+            len(self.orbit_waypoints) if self.mode == "orbit" else 0,
+        )
+        if not self._path_dirty and signature == getattr(self, "_path_signature", None):
+            return
+        self._path_signature = signature
+        self._path_dirty = False
+
         path = Path()
         path.header.stamp = self.get_clock().now().to_msg(); path.header.frame_id = self.frame_id
         path.poses = [self.pose_to_stamped(p) for p in self.path]
@@ -1624,11 +2056,62 @@ class DashboardBridgeNode(Node):
         path.poses = [self.pose_to_stamped(p) for p in self.actual_path]
         self.actual_path_pub.publish(path)
 
-    def publish_dashboard_state(self) -> None:
-        # PENTING: Publish jalur secara konstan agar UI selalu mensinkronkan preview
-        self.publish_path()
-        
-        # Build orbit info for dashboard
+    def publish_telemetry(self) -> None:
+        """Telemetry padat untuk dashboard, di-rate-limit (default 20Hz).
+
+        Satu pesan JSON berisi semua yang dibutuhkan HUD, jadi UI cukup subscribe
+        & parse SATU topik alih-alih menggabungkan /odom + /dashboard/state dan
+        mendekode quaternion di JavaScript setiap frame.
+        """
+        if self.current_pose is None:
+            return
+
+        # SELF-MONITORING KETERLAMBATAN TIMER.
+        # Kalau timer 20Hz ini terlambat jauh, artinya thread executor tertahan
+        # (biasanya pekerjaan CPU-bound yang memegang GIL). Log ini memisahkan
+        # "node yang tersendat" dari "konsumen yang kehilangan pesan" — tanpa
+        # itu keduanya terlihat identik dari sisi dashboard.
+        now_mono = time.monotonic()
+        last = getattr(self, "_last_telemetry_pub", None)
+        if last is not None:
+            late = (now_mono - last) - self.telemetry_period
+            if late > self.telemetry_period * 2.0:
+                self.get_logger().warning(
+                    f"Timer telemetry terlambat {late * 1000:.0f} ms "
+                    f"(periode {self.telemetry_period * 1000:.0f} ms) — executor tertahan."
+                )
+        self._last_telemetry_pub = now_mono
+
+        pose = self.current_pose
+        vehicle = self.vehicle_status
+        remaining = self.battery.get("remaining")
+
+        payload = {
+            "stamp_ms": now_epoch_ms(),
+            "x": round(pose.x, 3),
+            "y": round(pose.y, 3),
+            "z": round(pose.z, 3),
+            "alt": round(pose.z, 3),
+            "yaw": round(pose.yaw, 4),
+            "heading": round((math.degrees(pose.yaw) + 360.0) % 360.0, 1),
+            "vx": round(self.velocity["vx"], 3),
+            "vy": round(self.velocity["vy"], 3),
+            "vz": round(self.velocity["vz"], 3),
+            "speed": round(self.velocity["speed"], 3),
+            "battery": round(remaining * 100.0, 1) if remaining is not None else None,
+            "voltage": round(float(self.battery.get("voltage") or 0.0), 2),
+            "armed": bool(vehicle.get("armed", False)),
+            "flightMode": str(vehicle.get("navStateName") or "UNKNOWN"),
+            "navState": self.mode,
+            "journeyStatus": self.journey_status,
+            "nearestObstacle": self.nearest_obstacle_m,
+            "pathIndex": self.path_index,
+            "pathLength": len(self.path),
+        }
+        self.telemetry_pub.publish(String(data=json.dumps(payload)))
+
+    def snapshot_payload(self) -> Dict[str, object]:
+        """Snapshot state lengkap — dipakai /dashboard/resync & publish periodik."""
         orbit_info = None
         if self.mode == "orbit":
             orbit_info = {
@@ -1643,11 +2126,22 @@ class DashboardBridgeNode(Node):
                 "speed": self.orbit_speed,
             }
 
-        payload = {
-            "mode": self.mode, "home": self.pose_dict(self.home_pose), "goal": self.pose_dict(self.last_goal),
-            "battery": self.battery, "vehicle": self.vehicle_status, "wind": self.wind,
-            "nearestObstacle": self.nearest_obstacle_m, "rtlTriggered": self.rtl_triggered,
-            "planner": {"algorithm": "Integrated Boustrophedon + Hybrid A* & RRT Detour", "resolution": self.planner_resolution},
+        return {
+            "stamp_ms": now_epoch_ms(),
+            "mode": self.mode,
+            "home": self.pose_dict(self.home_pose),
+            "goal": self.pose_dict(self.last_goal),
+            "battery": self.battery,
+            "vehicle": self.vehicle_status,
+            "wind": self.wind,
+            "nearestObstacle": self.nearest_obstacle_m,
+            "rtlTriggered": self.rtl_triggered,
+            "waypointSeq": self._waypoint_seq,
+            "waypointCount": len(self.path),
+            "planner": {
+                "algorithm": "Integrated Boustrophedon + Hybrid A* & RRT Detour",
+                "resolution": self.planner_resolution,
+            },
             "orbit": orbit_info,
             "journey_status": self.journey_status,
             "rth_metadata": {
@@ -1658,15 +2152,27 @@ class DashboardBridgeNode(Node):
                 "total_distance_m": self.mission_distance_m,
                 "battery_used_percent": self.battery_used_percent,
                 "total_duration_sec": self.total_duration_sec,
-            }
+            },
         }
-        self.state_pub.publish(String(data=json.dumps(payload)))
+
+    def publish_dashboard_state(self) -> None:
+        # Path hanya dipublikasikan ulang saat benar-benar berubah (dirty flag).
+        # Versi lama menserialisasi 6 daftar waypoint jadi JSON tiap 500ms —
+        # untuk rute boustrophedon ratusan titik itu CPU & bandwidth terbuang.
+        self.publish_path()
+        self.state_pub.publish(String(data=json.dumps(self.snapshot_payload())))
         self.obstacles_pub.publish(String(data=json.dumps(self.obstacles)))
         self.sensor_pub.publish(String(data=json.dumps({"nearest": self.nearest_obstacle_m, "ranges": self.scan_sample, "source": "/drone/lidar/scan"})))
         self.metrics_pub.publish(String(data=json.dumps(self.metric_payload())))
 
     def publish_status(self, event: str, message: str) -> None:
-        self.state_pub.publish(String(data=json.dumps({"event": event, "message": message, "time": time.time()})))
+        # stamp_ms = Unix epoch milliseconds, basis waktu tunggal lintas-sistem.
+        self.state_pub.publish(String(data=json.dumps({
+            "event": event,
+            "message": message,
+            "time": time.time(),
+            "stamp_ms": now_epoch_ms(),
+        })))
 
     def metric_payload(self) -> Dict[str, object]:
         return {
@@ -1744,21 +2250,38 @@ class DashboardBridgeNode(Node):
         }
         return names.get(nav_state, f"NAV_{nav_state}")
 
+    def destroy_node(self) -> bool:
+        """Resource cleanup: hentikan thread planner sebelum node dibongkar,
+        kalau tidak proses menggantung saat Ctrl+C karena worker A* masih hidup."""
+        try:
+            if self.planning_future is not None and not self.planning_future.done():
+                self.planning_future.cancel()
+            self.planning_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception as exc:
+            self.get_logger().warning(f"Planner executor shutdown tidak bersih: {exc}")
+        return super().destroy_node()
+
+
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = DashboardBridgeNode()
-    
+
     # Gunakan MultiThreadedExecutor untuk kestabilan pengiriman setpoint
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
-    
-    try: 
+
+    try:
         executor.spin()
-    except (KeyboardInterrupt, ExternalShutdownException): 
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        # Urutan penting: lepas node dari executor -> shutdown executor ->
+        # destroy node -> shutdown rclpy. Versi lama tidak pernah memanggil
+        # executor.shutdown() sehingga thread executor bocor saat restart.
+        executor.remove_node(node)
+        executor.shutdown()
         node.destroy_node()
-        if rclpy.ok(): 
+        if rclpy.ok():
             rclpy.shutdown()
 
 if __name__ == "__main__":

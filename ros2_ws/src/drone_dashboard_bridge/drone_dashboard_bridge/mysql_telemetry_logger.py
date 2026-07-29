@@ -25,7 +25,21 @@ from nav_msgs.msg import Odometry
 from rclpy.executors import MultiThreadedExecutor, ExternalShutdownException
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from std_msgs.msg import String
+
+# Harus cocok dengan profil di dashboard_bridge_node.py.
+SENSOR_QOS = QoSProfile(
+    reliability=QoSReliabilityPolicy.BEST_EFFORT,
+    history=QoSHistoryPolicy.KEEP_LAST,
+    depth=5,
+)
+
+COMMAND_QOS = QoSProfile(
+    reliability=QoSReliabilityPolicy.RELIABLE,
+    history=QoSHistoryPolicy.KEEP_LAST,
+    depth=10,
+)
 
 
 def utc_now() -> datetime:
@@ -185,20 +199,40 @@ class MySqlTelemetryLogger(Node):
         self.last_telemetry_insert = 0.0
         self.last_state_insert = 0.0
         self.latest_state: Dict[str, Any] = {}
-        self.seen_obstacle_keys = set()
-        self.seen_error_keys = set()
+        # Dedup key disimpan dalam deque terbatas + set pendamping. Versi lama
+        # memakai set murni yang tumbuh selamanya: misi panjang dengan ribuan
+        # deteksi LiDAR membuat RAM node naik terus (memory leak).
+        self._dedup_limit = 5000
+        self.seen_obstacle_keys: set = set()
+        self._obstacle_key_order: Deque = deque()
+        self.seen_error_keys: set = set()
+        self._error_key_order: Deque = deque()
 
         self.writer = MySqlBatchWriter(self)
 
-        self.create_subscription(Odometry, "/odom", self.odom_cb, 20, callback_group=self.fast_cb_group)
-        self.create_subscription(String, "/dashboard/state", self.state_cb, 20, callback_group=self.fast_cb_group)
-        self.create_subscription(String, "/dashboard/obstacles", self.obstacles_cb, 10, callback_group=self.fast_cb_group)
-        self.create_subscription(String, "/dashboard/metrics", self.metrics_cb, 10, callback_group=self.fast_cb_group)
-        self.create_subscription(String, "/dashboard/active_mission", self.active_mission_cb, 10, callback_group=self.fast_cb_group)
+        # /odom dipublikasikan bridge dengan BEST_EFFORT (stream sensor). Subscriber
+        # RELIABLE tidak kompatibel dengan publisher BEST_EFFORT — data tidak akan
+        # pernah sampai. Karena itu telemetry pakai SENSOR_QOS, sedangkan topik
+        # state/command tetap RELIABLE supaya event tidak ada yang hilang.
+        self.create_subscription(Odometry, "/odom", self.odom_cb, SENSOR_QOS, callback_group=self.fast_cb_group)
+        self.create_subscription(String, "/dashboard/state", self.state_cb, COMMAND_QOS, callback_group=self.fast_cb_group)
+        self.create_subscription(String, "/dashboard/obstacles", self.obstacles_cb, COMMAND_QOS, callback_group=self.fast_cb_group)
+        self.create_subscription(String, "/dashboard/metrics", self.metrics_cb, COMMAND_QOS, callback_group=self.fast_cb_group)
+        self.create_subscription(String, "/dashboard/active_mission", self.active_mission_cb, COMMAND_QOS, callback_group=self.fast_cb_group)
 
         flush_period = max(0.2, float(self.get_parameter("flush_period_sec").value))
         self.create_timer(flush_period, self.flush_tick, callback_group=self.db_cb_group)
         self.get_logger().info("MySQL telemetry logger ready with MultiThreadedExecutor.")
+
+    def _remember(self, key: Tuple, seen: set, order: Deque) -> bool:
+        """Dedup dengan jendela geser. Return False kalau key sudah pernah dilihat."""
+        if key in seen:
+            return False
+        seen.add(key)
+        order.append(key)
+        while len(order) > self._dedup_limit:
+            seen.discard(order.popleft())
+        return True
 
     def odom_cb(self, msg: Odometry) -> None:
         now = time.monotonic()
@@ -338,9 +372,8 @@ class MySqlTelemetryLogger(Node):
                 round(finite_or_none(obstacle.get("x")) or 0.0, 1),
                 round(finite_or_none(obstacle.get("y")) or 0.0, 1),
             )
-            if key in self.seen_obstacle_keys:
+            if not self._remember(key, self.seen_obstacle_keys, self._obstacle_key_order):
                 continue
-            self.seen_obstacle_keys.add(key)
 
             db_source = "gazebo" if source == "gazebo_sdf" else source
             if db_source not in {"gazebo", "lidar", "vision", "map", "manual"}:
@@ -378,9 +411,8 @@ class MySqlTelemetryLogger(Node):
         event = str(payload.get("event") or "unknown")
         message = str(payload.get("message") or event)
         key = (event, message, int(float(payload.get("time") or time.time())))
-        if key in self.seen_error_keys:
+        if not self._remember(key, self.seen_error_keys, self._error_key_order):
             return
-        self.seen_error_keys.add(key)
 
         subsystem = "navigation"
         severity = "info"
@@ -439,6 +471,10 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        # destroy_node() melakukan flush terakhir + menutup koneksi MySQL, jadi
+        # baris terakhir telemetry tidak hilang saat shutdown.
+        executor.remove_node(node)
+        executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

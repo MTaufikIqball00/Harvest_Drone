@@ -46,7 +46,45 @@ nohup MicroXRCEAgent udp4 -p 8888 > "$ROOT_DIR/logs/xrce_agent.log" 2>&1 &
 nohup ros2 launch rosbridge_server rosbridge_websocket_launch.xml port:=9090 > "$ROOT_DIR/logs/rosbridge.log" 2>&1 &
 
 # Dashboard Bridge Node
-nohup ros2 run drone_dashboard_bridge dashboard_bridge_node > "$ROOT_DIR/logs/dashboard_bridge.log" 2>&1 &
+# Pilih varian node sesuai flight stack yang akan dijalankan:
+#   --gazebo  -> PX4 SITL, jembatannya uORB/XRCE-DDS  (dashboard_bridge_node_px4)
+#   selain itu-> ArduPilot SITL, jembatannya MAVROS   (dashboard_bridge_node)
+# Menjalankan varian yang salah membuat dashboard tidak menerima telemetry apa
+# pun: node MAVROS menunggu /mavros/*, sedangkan PX4 hanya mem-publish /fmu/*.
+if [ "$MODE" == "--gazebo" ] || [ "$MODE" == "gazebo" ]; then
+    FLIGHT_STACK="px4"
+else
+    FLIGHT_STACK="ardupilot"
+fi
+echo "Dashboard bridge menggunakan flight stack: $FLIGHT_STACK"
+
+# MAVROS — WAJIB untuk jalur ArduPilot.
+#
+# BUG (sudah ada sebelumnya): tidak ada satu pun script di repo ini yang pernah
+# menjalankan MAVROS. Padahal dashboard_bridge_node berlangganan
+# /mavros/local_position/pose, /mavros/state, dan /mavros/battery, serta
+# memanggil service /mavros/cmd/arming & /mavros/set_mode.
+#
+# Tanpa MAVROS, topik-topik itu TIDAK PERNAH ADA, sehingga:
+#   - self.current_pose selamanya None
+#   - tombol TAKEOFF selalu ditolak dengan "Tidak ada local position."
+#   - dashboard tidak pernah menampilkan posisi/baterai/mode drone
+#
+# PX4 tidak memerlukan ini karena memakai jembatan uXRCE-DDS (/fmu/*).
+if [ "$FLIGHT_STACK" == "ardupilot" ]; then
+    # Port 14551 khusus MAVROS; 14550 dibiarkan untuk Mission Planner/QGC.
+    MAVROS_FCU_URL="${MAVROS_FCU_URL:-udp://:14551@}"
+    echo "=== Starting MAVROS (fcu_url=$MAVROS_FCU_URL) ==="
+    nohup ros2 launch mavros apm.launch \
+        fcu_url:="$MAVROS_FCU_URL" > "$ROOT_DIR/logs/mavros.log" 2>&1 &
+fi
+
+# Pakai `ros2 launch`, BUKAN `ros2 run`. Dengan `ros2 run` file launch tidak
+# pernah dibaca sehingga seluruh parameter tuning di dalamnya mati — antara lain
+# planner_resolution jatuh ke default kode 1.0 yang membuat satu kali A*
+# memakan ~1.6 detik CPU (seharusnya 5.0).
+nohup ros2 launch drone_dashboard_bridge dashboard_bridge.launch.py \
+    flight_stack:="$FLIGHT_STACK" > "$ROOT_DIR/logs/dashboard_bridge.log" 2>&1 &
 
 echo "=== Starting Next.js Frontend Dashboard (Port 3000) ==="
 cd "$ROOT_DIR/frontend"

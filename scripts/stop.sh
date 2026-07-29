@@ -7,11 +7,31 @@ echo "=== Stopping Drone-Stack Monorepo Services ==="
 
 kill_port() {
     local port=$1
-    local pid=$(ss -tulpn | grep ":${port} " | awk '{print $7}' | cut -d',' -f2 | cut -d'=' -f2 | head -n1)
-    if [ -n "$pid" ]; then
+    # BUG (sudah ada sebelumnya): ekstraksi PID lama mengandalkan posisi kolom
+    # ($7) dari output `ss`, padahal jumlah kolom berubah-ubah tergantung state
+    # soket. Hasilnya PID sering berupa sampah, contoh nyata dari log:
+    #   Killing process on port 3000 (PID: users:(("next-server)...
+    # `kill` lalu gagal diam-diam dan proses lama TIDAK pernah mati — port tetap
+    # dipakai sehingga layanan baru gagal bind.
+    #
+    # Sekarang PID diambil dengan regex dari pola `pid=<angka>` di mana pun ia
+    # muncul, dan hanya angka murni yang diterima.
+    local pids
+    pids=$(ss -tulpnH "sport = :${port}" 2>/dev/null \
+        | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+
+    if [ -z "$pids" ]; then
+        return 0
+    fi
+
+    for pid in $pids; do
+        case "$pid" in
+            ''|*[!0-9]*) continue ;;   # abaikan apa pun yang bukan angka
+        esac
+        [ "$pid" -le 1 ] && continue   # jangan pernah sentuh PID 0/1
         echo "Killing process on port $port (PID: $pid)..."
         kill -9 "$pid" 2>/dev/null || true
-    fi
+    done
 }
 
 # Release ports
