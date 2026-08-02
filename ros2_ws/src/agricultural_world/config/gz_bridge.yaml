@@ -39,16 +39,25 @@
   gz_type_name:   gz.msgs.FluidPressure
   direction:      GZ_TO_ROS
 
-# ── LiDAR (downward-facing altimeter) ────────────────────────
+# ── LiDAR 2D horizontal (deteksi rintangan + replanning) ─────
+# PENTING: model yang benar-benar dipakai adalah x500_lidar_2d (lihat
+# scripts/start_gazebo.sh: MODEL_NAME), BUKAN iris. Pemetaan lama menunjuk
+# /model/iris/.../lidar_down/scan — model & sensor yang tidak pernah ada di
+# dunia ini, sehingga /drone/lidar/scan selamanya kosong dan seluruh jalur
+# replanning berbasis LiDAR di dashboard_bridge_node_px4 mati diam-diam.
+#
+# Sensor lidar_2d_v2 tidak punya tag <topic>, jadi gz memakai nama default:
+#   /world/<world>/model/<model>/link/<link>/sensor/<sensor>/scan
+# Angka akhiran instance model (_0) mengikuti urutan spawn PX4 SITL.
 - ros_topic_name: /drone/lidar/scan
-  gz_topic_name:  /model/iris/link/base_link/sensor/lidar_down/scan
+  gz_topic_name:  /world/agricultural_field/model/x500_lidar_2d_0/link/link/sensor/lidar_2d_v2/scan
   ros_type_name:  sensor_msgs/msg/LaserScan
   gz_type_name:   gz.msgs.LaserScan
   direction:      GZ_TO_ROS
 
 # ── LiDAR PointCloud2 ────────────────────────────────────────
 - ros_topic_name: /drone/lidar/points
-  gz_topic_name:  /model/iris/link/base_link/sensor/lidar_down/scan/points
+  gz_topic_name:  /world/agricultural_field/model/x500_lidar_2d_0/link/link/sensor/lidar_2d_v2/scan/points
   ros_type_name:  sensor_msgs/msg/PointCloud2
   gz_type_name:   gz.msgs.PointCloudPacked
   direction:      GZ_TO_ROS

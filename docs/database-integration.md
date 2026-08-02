@@ -1,4 +1,19 @@
-# Integrasi Database Drone ROS 2, PX4, Gazebo, Next.js, MySQL
+# Integrasi Database Drone ROS 2, PX4, Gazebo, Next.js, PostgreSQL
+
+> **CATATAN MIGRASI (Agustus 2026).** Sistem ini sudah berpindah dari **MySQL**
+> ke **PostgreSQL** (agar bisa dihosting di Supabase). Yang berubah:
+>
+> | Komponen | Sebelum | Sesudah |
+> |---|---|---|
+> | Skema | `database/drone_schema.sql` | `database/supabase_schema.sql` |
+> | Driver frontend | `mysql2` (`lib/mysql.ts`) | `pg` (`lib/db.ts`) |
+> | Driver ROS 2 | `mysql-connector` / `PyMySQL` | `psycopg2` |
+> | Port default | 3306 | 5432 |
+> | Placeholder SQL | `?` | `$1, $2, ...` |
+>
+> Sebagian bab konseptual di bawah masih memakai istilah "MySQL"; isinya tetap
+> berlaku karena bersifat umum (indeks, retensi, batching), hanya nama produknya
+> yang berbeda. Bab 6 & 7 (setup & environment) sudah diperbarui.
 
 Dokumen ini mendesain backend database yang ringan, stabil, dan realistis untuk dashboard drone autonomous. Prinsip utamanya: telemetry realtime tidak boleh bergantung pada database untuk kontrol penerbangan. Database dipakai untuk histori, analytics, audit, replay, dan laporan.
 
@@ -220,66 +235,62 @@ Redis tidak wajib untuk satu drone dan satu dashboard. Tambahkan Redis jika:
 - API analytics mulai berat
 - ingin pub/sub backend tanpa langsung membaca MySQL berulang-ulang
 
-## 6. Setup MySQL dan phpMyAdmin
+## 6. Setup PostgreSQL
 
-1. Buat database dan tabel:
+Sistem ini sudah BERMIGRASI dari MySQL ke PostgreSQL (lihat catatan di bagian
+atas dokumen). Skema yang berlaku: `database/supabase_schema.sql`.
 
-```bash
-mysql -u root -p < /home/iqball/project/database/drone_schema.sql
-```
-
-2. Buat user aplikasi:
-
-```sql
-CREATE USER 'drone_app'@'%' IDENTIFIED BY 'change-this-password';
-GRANT SELECT, INSERT, UPDATE, DELETE ON drone_ops.* TO 'drone_app'@'%';
-FLUSH PRIVILEGES;
-```
-
-3. Login phpMyAdmin dengan user admin/root untuk inspeksi, backup, dan maintenance. Aplikasi jangan memakai user root.
-
-## 7. Environment Variables
-
-Frontend Next.js:
-
-```env
-DB_HOST=127.0.0.1
-DB_PORT=3306
-DB_USER=drone_app
-DB_PASSWORD=change-this-password
-DB_NAME=drone_ops
-API_WRITE_KEY=change-this-api-key
-```
-
-ROS2 logger:
-
-```bash
-export DRONE_DB_HOST=127.0.0.1
-export DRONE_DB_PORT=3306
-export DRONE_DB_USER=drone_app
-export DRONE_DB_PASSWORD=change-this-password
-export DRONE_DB_NAME=drone_ops
-export DRONE_DB_DRONE_ID=1
-```
-
-Install dependency runtime di Ubuntu/WSL:
+### Opsi A — PostgreSQL lokal
 
 ```bash
 sudo apt update
-sudo apt install -y mysql-server mysql-client python3-pymysql
+sudo apt install -y postgresql postgresql-contrib python3-psycopg2
+
+# PostgreSQL tidak auto-start di WSL2; jalankan tiap kali WSL dinyalakan
+sudo service postgresql start
+
+# Set password untuk user postgres
+sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'password-anda';"
+
+# Buat database + skema
+sudo -u postgres psql -c "CREATE DATABASE drone_ops;"
+sudo -u postgres psql -d drone_ops -f database/supabase_schema.sql
 ```
 
-Jika kamu juga ingin phpMyAdmin di mesin yang sama:
+### Opsi B — Supabase (cloud)
 
-```bash
-sudo apt install -y phpmyadmin
+1. Buat project di [supabase.com](https://supabase.com)
+2. Buka **SQL Editor**, tempel isi `database/supabase_schema.sql`, klik **Run**
+3. Ambil kredensial di **Project Settings → Database → Connection info**
+
+Pakai koneksi **Session pooler** atau **Direct connection** (port `5432`).
+JANGAN pakai **Transaction pooler** (port `6543`): mode itu tidak mendukung
+prepared statement yang dipakai `psycopg2.executemany()` di logger ROS 2,
+sehingga flush batch akan gagal terus-menerus.
+
+## 7. Environment Variables
+
+Frontend Next.js (`frontend/.env.local`):
+
+```env
+DB_HOST=127.0.0.1
+DB_PORT=5432
+DB_USER=postgres
+DB_PASSWORD=password-anda
+DB_NAME=drone_ops
+DB_SSL=false          # true bila memakai Supabase
 ```
 
-Aktifkan MySQL dan buat schema:
+ROS2 logger (lihat `ros2_ws/src/drone_dashboard_bridge/.env.supabase.example`):
 
 ```bash
-sudo service mysql start
-sudo mysql < /home/iqball/project/database/drone_schema.sql
+export DRONE_DB_HOST=127.0.0.1
+export DRONE_DB_PORT=5432
+export DRONE_DB_USER=postgres
+export DRONE_DB_PASSWORD=password-anda
+export DRONE_DB_NAME=drone_ops
+export DRONE_DB_SSLMODE=prefer   # require bila memakai Supabase
+export DRONE_DB_DRONE_ID=1
 ```
 
 Jalankan logger ROS2:

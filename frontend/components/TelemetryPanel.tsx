@@ -14,7 +14,7 @@
 
 import React from "react";
 import { useTelemetry, useVehicleState } from "@/lib/useRos";
-import { Gauge, Navigation, Battery, Compass, Wifi } from "lucide-react";
+import { Gauge, Navigation, Battery, Compass, Wifi, Satellite } from "lucide-react";
 
 const RAD_TO_DEG = 180 / Math.PI;
 
@@ -37,6 +37,33 @@ const LatencyBadge = React.memo(function LatencyBadge() {
   );
 });
 
+/**
+ * Indikator mode navigasi.
+ *
+ * Operator perlu tahu dengan pasti apakah target yang diklik akan diterbangkan
+ * ke koordinat bumi sungguhan (GPS) atau hanya sebagai jarak relatif (meter).
+ * Menyembunyikan perbedaan ini berbahaya: pada drone tanpa GPS, klik peta tetap
+ * menghasilkan gerakan, tetapi bukan ke lokasi geografis yang terlihat.
+ */
+const GpsBadge = React.memo(function GpsBadge() {
+  const { gpsValid } = useVehicleState();
+  return (
+    <span
+      className={`flex items-center gap-1 text-[10px] font-mono ${
+        gpsValid ? "text-emerald-400" : "text-amber-400"
+      }`}
+      title={
+        gpsValid
+          ? "GPS fix aktif — waypoint dikirim sebagai koordinat bumi (lat/lon)"
+          : "Tanpa GPS — waypoint dikirim sebagai jarak lokal (meter)"
+      }
+    >
+      <Satellite className="w-3 h-3" />
+      {gpsValid ? "GPS" : "LOKAL"}
+    </span>
+  );
+});
+
 function TelemetryPanelImpl() {
   const telemetry = useTelemetry();
 
@@ -54,8 +81,8 @@ function TelemetryPanelImpl() {
           </span>
           <span className="text-xs text-slate-400 font-medium">m</span>
         </div>
-        <div className="mt-1 flex items-center justify-between">
-          <span className="text-[10px] text-slate-500">Rel. ground level</span>
+        <div className="mt-1 flex items-center justify-between gap-2">
+          <GpsBadge />
           <LatencyBadge />
         </div>
       </div>

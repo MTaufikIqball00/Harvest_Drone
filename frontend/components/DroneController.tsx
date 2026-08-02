@@ -76,7 +76,8 @@ interface Props {
   onStartAutoSurvey: () => Promise<ServiceAck>;
   onEmergencyStop: () => Promise<ServiceAck>;
   onSendVelocity: (vx: number, vy: number, vz: number, yawRate: number) => boolean;
-  onSendWaypoints: (wps: Waypoint[]) => boolean;
+  /** Mengembalikan seq pengiriman (>= 1) bila berhasil, null bila gagal. */
+  onSendWaypoints: (wps: Waypoint[]) => number | null;
   onClearWaypoints?: () => void;
 }
 
@@ -115,7 +116,9 @@ function DroneControllerImpl({
 }: Props) {
   const vehicle = useVehicleState();
 
-  const [takeoffAlt, setTakeoffAlt] = useState<number>(8.0);
+  // Default 1 m: aman untuk uji coba pertama drone asli (DJI Spark) sebelum
+  // menaikkan target altitude setelah kontrol terbukti stabil.
+  const [takeoffAlt, setTakeoffAlt] = useState<number>(1.0);
   const [targetX, setTargetX] = useState<string>("20.0");
   const [targetY, setTargetY] = useState<string>("15.0");
   const [targetZ, setTargetZ] = useState<string>("8.0");
@@ -383,25 +386,37 @@ function DroneControllerImpl({
           Main Flight Controls
         </span>
 
-        <div className="grid grid-cols-2 gap-2.5">
-          <button
-            onClick={() => runCommand("ARM", onArm)}
-            disabled={!connected || vehicle.armed || busy}
-            className="flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white font-semibold transition-all shadow-md text-xs"
-          >
-            <Power className="w-4 h-4" /> ARM MOTORS
-          </button>
+        {/*
+          DJI Spark (dan flight stack lain yang tidak punya konsep arm
+          terpisah) mengirim armDisarmSupported=false lewat telemetry —
+          lihat RosBridgeClient.java. Tombol disembunyikan sepenuhnya alih-
+          alih dibuat no-op, supaya tidak menjanjikan perilaku yang tidak
+          ada: DJI motor auto-nyala saat TAKEOFF, tidak ada langkah arm
+          terpisah untuk ditekan operator.
+        */}
+        {vehicle.armDisarmSupported && (
+          <div className="grid grid-cols-2 gap-2.5">
+            <button
+              onClick={() => runCommand("ARM", onArm)}
+              disabled={!connected || vehicle.armed || busy}
+              className="flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white font-semibold transition-all shadow-md text-xs"
+            >
+              <Power className="w-4 h-4" /> ARM MOTORS
+            </button>
 
-          <button
-            onClick={() => runCommand("DISARM", onDisarm)}
-            disabled={!connected || busy}
-            className="flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-red-600/90 hover:bg-red-500 disabled:opacity-40 text-white font-semibold transition-all shadow-md text-xs"
-          >
-            <ShieldAlert className="w-4 h-4" /> DISARM / STOP
-          </button>
-        </div>
+            <button
+              onClick={() => runCommand("DISARM", onDisarm)}
+              disabled={!connected || busy}
+              className="flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-red-600/90 hover:bg-red-500 disabled:opacity-40 text-white font-semibold transition-all shadow-md text-xs"
+            >
+              <ShieldAlert className="w-4 h-4" /> DISARM / STOP
+            </button>
+          </div>
+        )}
 
-        <div className="grid grid-cols-3 gap-2">
+        {/* RTH tidak di-serve jembatan DJI (lihat RosBridgeClient.java) —
+            grid menyesuaikan jadi 2 kolom saat tombol itu disembunyikan. */}
+        <div className={`grid gap-2 ${vehicle.advancedFeaturesSupported ? "grid-cols-3" : "grid-cols-2"}`}>
           <button
             onClick={() => runCommand("TAKEOFF", () => onTakeoff(takeoffAlt))}
             disabled={!connected || busy}
@@ -418,13 +433,15 @@ function DroneControllerImpl({
             <PlaneLanding className="w-4 h-4" /> Land
           </button>
 
-          <button
-            onClick={() => runCommand("RTH", onRth)}
-            disabled={!connected || busy}
-            className="flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white font-medium text-xs transition-all"
-          >
-            <Home className="w-4 h-4" /> Return Home
-          </button>
+          {vehicle.advancedFeaturesSupported && (
+            <button
+              onClick={() => runCommand("RTH", onRth)}
+              disabled={!connected || busy}
+              className="flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white font-medium text-xs transition-all"
+            >
+              <Home className="w-4 h-4" /> Return Home
+            </button>
+          )}
         </div>
 
         <div className="flex items-center gap-2">
@@ -435,37 +452,45 @@ function DroneControllerImpl({
             max={50}
             step={0.5}
             value={takeoffAlt}
-            onChange={(e) => setTakeoffAlt(Number(e.target.value) || 8)}
+            onChange={(e) => setTakeoffAlt(Number(e.target.value) || 1)}
             className="w-20 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-cyan-300 font-mono focus:outline-none focus:border-cyan-500"
           />
           <span className="text-[10px] text-slate-500">Dikirim ke node sebelum takeoff</span>
         </div>
 
-        <div className="grid grid-cols-2 gap-2 mt-1">
-          <button
-            onClick={() => runCommand("FORCE ARM + TAKEOFF", onForceArmTakeoff)}
-            disabled={!connected || busy}
-            className="flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 disabled:opacity-40 text-white font-bold text-xs shadow-lg transition-all border border-purple-400/30"
-          >
-            <Zap className="w-4 h-4 text-yellow-300 fill-yellow-300" /> Force Arm & Takeoff
-          </button>
+        {/* Force Arm+Takeoff, Auto Survey (boustrophedon/A*), dan Emergency
+            Stop (LOITER) adalah fitur khusus ArduPilot/PX4 — tidak ada
+            padanan yang di-serve jembatan DJI, jadi disembunyikan total
+            alih-alih tampil lalu timeout. */}
+        {vehicle.advancedFeaturesSupported && (
+          <>
+            <div className="grid grid-cols-2 gap-2 mt-1">
+              <button
+                onClick={() => runCommand("FORCE ARM + TAKEOFF", onForceArmTakeoff)}
+                disabled={!connected || busy}
+                className="flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 disabled:opacity-40 text-white font-bold text-xs shadow-lg transition-all border border-purple-400/30"
+              >
+                <Zap className="w-4 h-4 text-yellow-300 fill-yellow-300" /> Force Arm & Takeoff
+              </button>
 
-          <button
-            onClick={() => runCommand("AUTO SURVEY", onStartAutoSurvey)}
-            disabled={!connected || busy}
-            className="flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 disabled:opacity-40 text-white font-bold text-xs shadow-lg transition-all border border-cyan-400/30"
-          >
-            <Navigation className="w-4 h-4 text-cyan-200" /> Auto Survey
-          </button>
-        </div>
+              <button
+                onClick={() => runCommand("AUTO SURVEY", onStartAutoSurvey)}
+                disabled={!connected || busy}
+                className="flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 disabled:opacity-40 text-white font-bold text-xs shadow-lg transition-all border border-cyan-400/30"
+              >
+                <Navigation className="w-4 h-4 text-cyan-200" /> Auto Survey
+              </button>
+            </div>
 
-        <button
-          onClick={() => runCommand("EMERGENCY STOP", onEmergencyStop)}
-          disabled={!connected}
-          className="flex items-center justify-center gap-2 py-2 px-3 rounded-xl bg-red-900/70 hover:bg-red-800 disabled:opacity-40 text-red-100 font-bold text-xs border border-red-600/60 transition-all"
-        >
-          <ShieldAlert className="w-4 h-4" /> EMERGENCY STOP (LOITER)
-        </button>
+            <button
+              onClick={() => runCommand("EMERGENCY STOP", onEmergencyStop)}
+              disabled={!connected}
+              className="flex items-center justify-center gap-2 py-2 px-3 rounded-xl bg-red-900/70 hover:bg-red-800 disabled:opacity-40 text-red-100 font-bold text-xs border border-red-600/60 transition-all"
+            >
+              <ShieldAlert className="w-4 h-4" /> EMERGENCY STOP (LOITER)
+            </button>
+          </>
+        )}
       </div>
 
       {/* Remote Manual Control */}
@@ -554,14 +579,28 @@ function DroneControllerImpl({
           {lastWp && (
             <div
               className={`text-[10px] px-2 py-1 rounded border ${
-                lastWp.confirmed
-                  ? "text-emerald-300 border-emerald-500/40 bg-emerald-500/10"
-                  : "text-amber-300 border-amber-500/40 bg-amber-500/10"
+                lastWp.rejected
+                  ? "text-red-300 border-red-500/50 bg-red-500/10"
+                  : lastWp.confirmed
+                    ? "text-emerald-300 border-emerald-500/40 bg-emerald-500/10"
+                    : "text-amber-300 border-amber-500/40 bg-amber-500/10"
               }`}
             >
-              {lastWp.confirmed
-                ? `✓ Node mengonfirmasi ${waypoints.length} waypoint (seq ${vehicle.ackedSeq})`
-                : "⏳ Menunggu ACK dari node ROS — status belum dikonfirmasi"}
+              {lastWp.rejected ? (
+                <>
+                  {/* Alasan penolakan WAJIB ditampilkan. Sebelumnya pesan ini
+                      hanya tersimpan di store tanpa pernah dirender, sehingga
+                      penolakan tidak bisa dibedakan dari pesan yang hilang. */}
+                  <div className="font-semibold">✕ Waypoint ditolak node</div>
+                  <div className="opacity-90">
+                    {vehicle.ackMessage || "Alasan tidak disertakan."}
+                  </div>
+                </>
+              ) : lastWp.confirmed ? (
+                `✓ Node mengonfirmasi ${waypoints.length} waypoint (seq ${vehicle.ackedSeq})`
+              ) : (
+                "⏳ Menunggu ACK dari node ROS — status belum dikonfirmasi"
+              )}
             </div>
           )}
 

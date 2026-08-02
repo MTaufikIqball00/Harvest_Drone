@@ -50,6 +50,32 @@ export interface TelemetryData {
   navState: string;
   /** Unix epoch ms dari node ROS 2 — basis waktu tunggal lintas sistem. */
   stampMs: number;
+  /**
+   * true bila autopilot punya fix GPS dan lat/lon di atas adalah koordinat
+   * bumi SESUNGGUHNYA. Bila false, lat/lon hanyalah proyeksi dari posisi
+   * lokal (meter) terhadap origin peta — cukup untuk menggambar marker,
+   * tetapi bukan lokasi geografis nyata.
+   */
+  gpsValid: boolean;
+  /**
+   * Jarak (meter) ke rintangan terdekat di sektor depan hasil LiDAR, atau null
+   * bila tidak ada yang terdeteksi. Ikut jalur telemetry 20Hz agar bar
+   * penghindaran rintangan (ODI) bereaksi realtime, bukan pada state 2Hz.
+   */
+  nearestObstacle: number | null;
+  /**
+   * false untuk flight stack yang tidak punya konsep "arm" terpisah dari
+   * takeoff (mis. DJI Spark — motor auto-nyala saat startTakeoff()). Default
+   * true (tidak dikirim) supaya ArduPilot/PX4 tidak perlu berubah apa pun.
+   */
+  armDisarmSupported: boolean;
+  /**
+   * false untuk flight stack yang tidak mengimplementasikan fitur misi lanjutan
+   * (RTH, emergency stop, force-arm-takeoff, auto-survey/orbit) maupun world
+   * simulasi Gazebo — mis. jembatan DJI Spark (RosBridgeClient.java) yang hanya
+   * meneruskan kontrol dasar (manual, takeoff, land, satu waypoint GPS).
+   */
+  advancedFeaturesSupported: boolean;
 }
 
 export interface VehicleState {
@@ -62,8 +88,31 @@ export interface VehicleState {
   latencyMs: number;
   /** Waypoint seq terakhir yang di-ACK node. */
   ackedSeq: number;
+  /**
+   * Waypoint seq terakhir yang DITOLAK node (waypoints_nack).
+   *
+   * Terpisah dari ackedSeq karena penolakan harus ikut MEMBERSIHKAN status
+   * pending di UI. Tanpa field ini, penolakan hanya mengisi ackMessage dan
+   * badge "Menunggu ACK" bertahan selamanya — gejalanya jadi identik dengan
+   * "pesan tidak pernah sampai", padahal penyebabnya berbeda jauh.
+   */
+  nackedSeq: number;
+  /**
+   * Waypoint seq yang drone-nya sudah BENAR-BENAR TIBA di tujuan
+   * (event "mission_complete" dari jembatan, dipicu saat jarak <= radius
+   * terima). Berbeda dari ackedSeq yang hanya berarti "perintah diterima".
+   */
+  completedSeq: number;
   ackMessage: string;
   nearestObstacle: number | null;
+  /** Autopilot punya fix GPS -> waypoint bisa dikirim sebagai lat/lon. */
+  gpsValid: boolean;
+  /** Dashboard menyembunyikan tombol ARM/DISARM saat ini false (lihat
+   *  DroneController.tsx) — dipakai untuk mode DJI Spark. */
+  armDisarmSupported: boolean;
+  /** Dashboard menyembunyikan RTH/Emergency Stop/Force Arm+Takeoff/Auto Survey
+   *  dan peta simulasi Gazebo saat ini false — dipakai untuk mode DJI Spark. */
+  advancedFeaturesSupported: boolean;
 }
 
 export interface Waypoint {
@@ -75,11 +124,45 @@ export interface Waypoint {
   lon?: number;
   /** true setelah node membalas ACK untuk seq pengiriman ini. */
   confirmed?: boolean;
+  /** true bila node MENOLAK waypoint ini (waypoints_nack). Marker sengaja
+   *  dipertahankan agar operator melihat titik mana yang gagal, bukan hilang
+   *  diam-diam. Alasannya ada di VehicleState.ackMessage. */
+  rejected?: boolean;
+  /**
+   * true setelah perintah BENAR-BENAR dikirim ke drone (tombol "Send Goal"),
+   * false bila marker baru dipasang di peta tapi belum dikirim.
+   *
+   * Dipakai peta untuk memutuskan apakah menggambar garis rute drone -> target:
+   * menggambarnya sebelum dikirim akan menyiratkan drone sedang menuju ke sana,
+   * padahal perintahnya belum berangkat sama sekali.
+   */
+  sent?: boolean;
 }
 
 export interface TrailPoint {
   x: number;
   y: number;
+}
+
+/** Satu titik pada rute misi terencana (mis. jalur boustrophedon auto survey). */
+export interface PlannedPathPoint {
+  x: number;
+  y: number;
+  z: number;
+}
+
+/** Rintangan yang dilacak node (pohon SDF statis atau deteksi LiDAR dinamis),
+ *  diterima lewat /dashboard/obstacles. Dipakai bar ODI untuk mengenali
+ *  rintangan mana yang sedang dihindari drone. */
+export interface ObstacleMarker {
+  id: string;
+  kind: string;
+  x: number;
+  y: number;
+  radius: number;
+  clearance: number;
+  source: string;
+  active: boolean;
 }
 
 /** Rate publish snapshot ke React. 20Hz cukup halus untuk mata, 3x lebih murah
@@ -113,6 +196,10 @@ export const DEFAULT_TELEMETRY: TelemetryData = {
   armed: false,
   navState: "idle",
   stampMs: 0,
+  gpsValid: false,
+  nearestObstacle: null,
+  armDisarmSupported: true,
+  advancedFeaturesSupported: true,
 };
 
 const DEFAULT_VEHICLE: VehicleState = {
@@ -123,8 +210,13 @@ const DEFAULT_VEHICLE: VehicleState = {
   rtlTriggered: false,
   latencyMs: 0,
   ackedSeq: 0,
+  nackedSeq: 0,
+  completedSeq: 0,
   ackMessage: "",
   nearestObstacle: null,
+  gpsValid: false,
+  armDisarmSupported: true,
+  advancedFeaturesSupported: true,
 };
 
 type Listener = () => void;
@@ -139,12 +231,22 @@ class TelemetryStore {
   private telemetryListeners = new Set<Listener>();
   private vehicleListeners = new Set<Listener>();
   private trailListeners = new Set<Listener>();
+  private plannedPathListeners = new Set<Listener>();
+  private obstacleListeners = new Set<Listener>();
 
   /** Trail sebagai ring buffer — tidak pernah realokasi array besar. */
   private trail: TrailPoint[] = [];
   private trailSnapshot: TrailPoint[] = [];
   private trailDirty = false;
   private lastTrailPoint: TrailPoint | null = null;
+
+  /** Rute misi terencana (mis. jalur boustrophedon), diterima lewat
+   *  /dashboard/paths_json. Frekuensi rendah — hanya berubah saat misi baru
+   *  dimulai/dihapus, jadi listener-nya tidak perlu dibatasi seperti trail. */
+  private plannedPath: PlannedPathPoint[] = [];
+
+  /** Daftar rintangan aktif dari node, diterima lewat /dashboard/obstacles. */
+  private obstacles: ObstacleMarker[] = [];
 
   private lastPublish = 0;
   private rafHandle: number | null = null;
@@ -178,6 +280,10 @@ class TelemetryStore {
     if (typeof data.battery === "number") live.battery = data.battery;
     if (typeof data.voltage === "number") live.voltage = data.voltage;
     if (typeof data.stampMs === "number") live.stampMs = data.stampMs;
+    // null valid (tidak ada rintangan terdeteksi) — jangan disaring seperti angka.
+    if (data.nearestObstacle === null || typeof data.nearestObstacle === "number") {
+      live.nearestObstacle = data.nearestObstacle;
+    }
 
     if (typeof data.armed === "boolean" && data.armed !== live.armed) {
       live.armed = data.armed;
@@ -191,6 +297,24 @@ class TelemetryStore {
       live.navState = data.navState;
       vehicleChanged = true;
     }
+    if (typeof data.gpsValid === "boolean" && data.gpsValid !== live.gpsValid) {
+      live.gpsValid = data.gpsValid;
+      vehicleChanged = true;
+    }
+    if (
+      typeof data.armDisarmSupported === "boolean" &&
+      data.armDisarmSupported !== live.armDisarmSupported
+    ) {
+      live.armDisarmSupported = data.armDisarmSupported;
+      vehicleChanged = true;
+    }
+    if (
+      typeof data.advancedFeaturesSupported === "boolean" &&
+      data.advancedFeaturesSupported !== live.advancedFeaturesSupported
+    ) {
+      live.advancedFeaturesSupported = data.advancedFeaturesSupported;
+      vehicleChanged = true;
+    }
 
     this.appendTrail(live.x, live.y);
 
@@ -200,6 +324,9 @@ class TelemetryStore {
         armed: live.armed,
         flightMode: live.flightMode,
         navState: live.navState,
+        gpsValid: live.gpsValid,
+        armDisarmSupported: live.armDisarmSupported,
+        advancedFeaturesSupported: live.advancedFeaturesSupported,
       });
     }
 
@@ -253,7 +380,22 @@ class TelemetryStore {
         ackMessage: String(payload.message || ""),
       });
     } else if (event === "waypoints_nack") {
-      this.patchVehicle({ ackMessage: `DITOLAK: ${payload.message || "tidak diketahui"}` });
+      // seq WAJIB ikut dipatch. Versi lama hanya mengisi ackMessage, sehingga
+      // UI tidak punya cara mengetahui bahwa pengiriman ini sudah selesai
+      // (dengan hasil ditolak) dan terus menampilkan "Menunggu ACK".
+      this.patchVehicle({
+        nackedSeq: Number(payload.seq) || 0,
+        ackMessage: `DITOLAK: ${payload.message || "tidak diketahui"}`,
+      });
+    } else if (event === "mission_complete") {
+      // Drone benar-benar TIBA di waypoint. Jembatan DJI mengirim ini dari
+      // loop kontrolnya saat jarak <= radius terima; inilah satu-satunya
+      // sinyal kedatangan yang tersedia — posisi live saja tidak cukup karena
+      // dashboard tidak tahu ambang radius yang dipakai jembatan.
+      this.patchVehicle({
+        completedSeq: Number(payload.seq) || 0,
+        ackMessage: String(payload.message || "Waypoint tercapai."),
+      });
     } else if (payload.message) {
       this.patchVehicle({ ackMessage: String(payload.message) });
     }
@@ -301,6 +443,45 @@ class TelemetryStore {
   subscribeTrail = (listener: Listener): (() => void) => {
     this.trailListeners.add(listener);
     return () => this.trailListeners.delete(listener);
+  };
+
+  // ---------------------------------------------------------------------------
+  // PLANNED PATH — rute misi (mis. boustrophedon auto survey)
+  // ---------------------------------------------------------------------------
+  /** Terapkan payload /dashboard/paths_json — dipakai rute "final" node. */
+  ingestPlannedPath(points: PlannedPathPoint[]): void {
+    this.plannedPath = points;
+    this.plannedPathListeners.forEach((fn) => fn());
+  }
+
+  clearPlannedPath(): void {
+    if (this.plannedPath.length === 0) return;
+    this.plannedPath = [];
+    this.plannedPathListeners.forEach((fn) => fn());
+  }
+
+  getPlannedPathSnapshot = (): PlannedPathPoint[] => this.plannedPath;
+
+  subscribePlannedPath = (listener: Listener): (() => void) => {
+    this.plannedPathListeners.add(listener);
+    return () => this.plannedPathListeners.delete(listener);
+  };
+
+  // ---------------------------------------------------------------------------
+  // OBSTACLES — pohon SDF statis + deteksi LiDAR dinamis (/dashboard/obstacles)
+  // ---------------------------------------------------------------------------
+  /** Terapkan payload /dashboard/obstacles (2Hz). Referensi baru tiap update
+   *  supaya useSyncExternalStore mendeteksi perubahan. */
+  ingestObstacles(list: ObstacleMarker[]): void {
+    this.obstacles = list;
+    this.obstacleListeners.forEach((fn) => fn());
+  }
+
+  getObstaclesSnapshot = (): ObstacleMarker[] => this.obstacles;
+
+  subscribeObstacles = (listener: Listener): (() => void) => {
+    this.obstacleListeners.add(listener);
+    return () => this.obstacleListeners.delete(listener);
   };
 
   // ---------------------------------------------------------------------------

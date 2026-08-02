@@ -66,6 +66,14 @@ CREATE TABLE IF NOT EXISTS missions (
     dest_x FLOAT,
     dest_y FLOAT,
     flight_mode VARCHAR(50) DEFAULT 'auto',
+    -- Jarak drone -> waypoint tujuan pada SAAT "Send Goal" ditekan (meter).
+    -- Sengaja dipisah dari total_distance_m: yang ini jarak rencana lurus ke
+    -- target, sedangkan total_distance_m adalah jarak tempuh aktual (yang
+    -- selalu lebih besar karena drone menghindari rintangan).
+    goal_distance_m FLOAT DEFAULT NULL,
+    -- Basis perhitungan goal_distance_m: 'gps' (haversine lat/lon) atau
+    -- 'local' (Euclidean pada koordinat lokal). Keduanya satuan METER.
+    goal_distance_source VARCHAR(10) DEFAULT NULL,
     total_distance_m FLOAT DEFAULT 0.0,
     battery_used_percent FLOAT DEFAULT 0.0,
     status ENUM('planned', 'in_progress', 'completed', 'failed', 'aborted') DEFAULT 'in_progress',

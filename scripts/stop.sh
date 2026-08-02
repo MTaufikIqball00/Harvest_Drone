@@ -48,6 +48,8 @@ pkill -f "next-server" 2>/dev/null || true
 pkill -f "rosbridge_websocket" 2>/dev/null || true
 pkill -f "MicroXRCEAgent" 2>/dev/null || true
 pkill -f "dashboard_bridge_node" 2>/dev/null || true
+pkill -f "parameter_bridge" 2>/dev/null || true
+pkill -f "mysql_telemetry_logger" 2>/dev/null || true
 pkill -f "px4" 2>/dev/null || true
 pkill -f "gz" 2>/dev/null || true
 

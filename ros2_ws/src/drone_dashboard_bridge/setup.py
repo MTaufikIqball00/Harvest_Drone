@@ -14,7 +14,7 @@ setup(
             "launch/mysql_telemetry_logger.launch.py",
         ]),
     ],
-    install_requires=["setuptools", "mysql-connector-python", "PyMySQL"],
+    install_requires=["setuptools", "psycopg2-binary"],
     zip_safe=True,
     maintainer="Drone Dashboard",
     maintainer_email="user@example.com",

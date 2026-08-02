@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
+import csv
 import heapq
 import json
 import math
+import os
 import threading
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -34,6 +37,12 @@ from rclpy.qos import (
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32, String
 from std_srvs.srv import Trigger
+
+from drone_dashboard_bridge.geodesy import (
+    geodetic_to_local,
+    is_valid_latlon,
+    local_to_geodetic,
+)
 
 # QoS untuk topik uORB dari agent uXRCE-DDS.
 #
@@ -147,7 +156,7 @@ class DashboardBridgeNode(Node):
         self.declare_parameter("marker_frame", "map")
         self.declare_parameter("spawn_x", -65.0)
         self.declare_parameter("spawn_y", 0.0)
-        self.declare_parameter("takeoff_altitude", 8.0)
+        self.declare_parameter("takeoff_altitude", 1.0)
         self.declare_parameter("landing_altitude", 0.3)
         self.declare_parameter("manual_speed", 3.5)
         self.declare_parameter("vertical_speed", 3.0)
@@ -192,6 +201,15 @@ class DashboardBridgeNode(Node):
         # dashboard yang sama bisa dipakai untuk kedua flight stack.
         self.journey_status = "Idle"
         self._waypoint_seq = 0
+
+        # --- Referensi GPS ---
+        # gps_valid=False berarti drone tidak punya fix (atau memang tanpa GPS);
+        # sistem lalu beroperasi murni dalam meter lokal. Begitu fix tersedia,
+        # ref_lat/ref_lon terisi dan waypoint lat/lon menjadi mungkin.
+        self.gps_valid = False
+        self.ref_lat: Optional[float] = None
+        self.ref_lon: Optional[float] = None
+        self.ref_alt: Optional[float] = None
 
         # 3 Palm Trees from agricultural_field.sdf
         self.obstacles = [
@@ -253,6 +271,7 @@ class DashboardBridgeNode(Node):
         # race condition antara thread ThreadPoolExecutor (done_cb planner)
         # dan thread MultiThreadedExecutor (control_tick 20Hz).
         self._path_lock = threading.Lock()
+        self._init_test_loggers()
         self.path: List[Pose2D] = []
         self.path_index = 0
         self.actual_path: List[Pose2D] = []
@@ -465,6 +484,47 @@ class DashboardBridgeNode(Node):
         pose.x += self.spawn_x; pose.y += self.spawn_y
         self.set_current_pose(pose)
 
+    # ------------------------------------------------------------------
+    # JEMBATAN GPS <-> FRAME LOKAL
+    # ------------------------------------------------------------------
+    def pose_to_latlon(self, pose: Pose2D) -> Tuple[Optional[float], Optional[float]]:
+        """Posisi lokal -> lat/lon. None bila tidak ada referensi GPS."""
+        if not self.gps_valid or self.ref_lat is None:
+            return None, None
+        # Buang offset spawn: frame lokal autopilot ber-origin di ref_lat/ref_lon,
+        # sedangkan Pose2D kita menambahkan spawn_x/spawn_y untuk keperluan peta.
+        east = pose.x - self.spawn_x
+        north = pose.y - self.spawn_y
+        return local_to_geodetic(east, north, self.ref_lat, self.ref_lon)
+
+    def latlon_to_pose_xy(self, lat: float, lon: float) -> Tuple[float, float]:
+        """lat/lon -> (x, y) frame lokal Pose2D (sudah termasuk offset spawn)."""
+        east, north = geodetic_to_local(lat, lon, self.ref_lat, self.ref_lon)
+        return east + self.spawn_x, north + self.spawn_y
+
+    def resolve_waypoint(self, item: dict) -> Tuple[Optional[float], Optional[float], str]:
+        """Tentukan (x, y) target dari satu entri waypoint.
+
+        Menerima DUA bentuk dan memilih otomatis:
+          - {"lat": .., "lon": ..}  -> dipakai bila GPS aktif (drone asli ber-GPS)
+          - {"x": .., "y": ..}      -> jarak lokal dalam meter (tanpa GPS)
+
+        Bila entri membawa lat/lon TAPI GPS tidak aktif, kita TOLAK alih-alih
+        diam-diam menerbangkan drone ke tempat yang salah: tanpa referensi
+        geodetik, lat/lon tidak bisa diterjemahkan ke frame lokal.
+        """
+        has_geo = is_valid_latlon(item.get("lat"), item.get("lon"))
+        has_xy = isinstance(item.get("x"), (int, float)) and isinstance(item.get("y"), (int, float))
+
+        if has_geo:
+            if not self.gps_valid:
+                return None, None, "Waypoint memakai lat/lon tetapi GPS belum fix."
+            x, y = self.latlon_to_pose_xy(float(item["lat"]), float(item["lon"]))
+            return x, y, "gps"
+        if has_xy:
+            return float(item["x"]), float(item["y"]), "local"
+        return None, None, "Waypoint tidak punya (lat,lon) maupun (x,y)."
+
     def _subscribe_versioned(self, msg_type, base_topic: str, suffixes, callback, cb_group) -> None:
         """Berlangganan satu topik uORB pada nama dasar DAN nama ber-versi.
 
@@ -483,6 +543,26 @@ class DashboardBridgeNode(Node):
     def vehicle_local_position_cb(self, msg: VehicleLocalPosition) -> None:
         if not (msg.xy_valid and msg.z_valid): return
 
+        # REFERENSI GEODETIK.
+        # PX4 menandai `xy_global` = True begitu EKF2 punya origin global (yaitu
+        # setelah GPS fix). ref_lat/ref_lon adalah titik nol frame lokal dalam
+        # koordinat bumi — inilah jembatan antara meter dan lat/lon.
+        # Kalau drone TIDAK punya GPS, xy_global tetap False dan seluruh sistem
+        # otomatis bekerja dalam meter saja tanpa perubahan apa pun.
+        if msg.xy_global and is_valid_latlon(msg.ref_lat, msg.ref_lon):
+            if not self.gps_valid:
+                self.get_logger().info(
+                    f"GPS aktif. Origin lokal = ({msg.ref_lat:.7f}, {msg.ref_lon:.7f}). "
+                    "Waypoint lat/lon sekarang didukung."
+                )
+            self.gps_valid = True
+            self.ref_lat = float(msg.ref_lat)
+            self.ref_lon = float(msg.ref_lon)
+            self.ref_alt = float(msg.ref_alt) if msg.z_global else None
+        elif self.gps_valid:
+            self.get_logger().warning("GPS hilang. Kembali ke mode navigasi berbasis jarak (meter).")
+            self.gps_valid = False
+
         # Ambil kecepatan langsung dari PX4 (lebih akurat daripada menurunkannya
         # dari beda posisi). PX4 memakai NED, dashboard memakai ENU:
         #   ENU vx (timur) = NED vy | ENU vy (utara) = NED vx | ENU vz = -NED vz
@@ -496,6 +576,80 @@ class DashboardBridgeNode(Node):
         pose = self.ned_to_enu_pose(north=float(msg.x), east=float(msg.y), down=float(msg.z), yaw=math.pi / 2.0 - float(msg.heading))
         pose.x += self.spawn_x; pose.y += self.spawn_y
         self.set_current_pose(pose)
+
+    # ------------------------------------------------------------------
+    # INSTRUMENTASI LOGGING PENGUJIAN (Bab 4) — murni pencatatan data,
+    # tidak mengubah logika/perilaku node.
+    # ------------------------------------------------------------------
+    def _init_test_loggers(self) -> None:
+        self._test_log_lock = threading.Lock()
+        logs_dir = os.path.join(os.getcwd(), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        self._replanning_log_path = os.path.join(logs_dir, "replanning_log.csv")
+        self._takeoff_landing_log_path = os.path.join(logs_dir, "takeoff_landing_log.csv")
+        self._trajectory_log_path = os.path.join(logs_dir, "trajectory_log.csv")
+        self._write_csv_header(self._replanning_log_path, [
+            "timestamp", "algorithm_used", "obstacle_count",
+            "computation_time_ms", "path_length_m", "odi_threshold_used",
+        ])
+        self._write_csv_header(self._takeoff_landing_log_path, [
+            "timestamp", "event_type", "start_time", "end_time",
+            "duration_sec", "success",
+        ])
+        self._write_csv_header(self._trajectory_log_path, [
+            "timestamp", "x", "y", "z", "source",
+        ])
+
+        # State untuk instrumentasi takeoff/landing.
+        self._takeoff_log_start_mono: Optional[float] = None
+        self._takeoff_log_start_iso: Optional[str] = None
+        self._takeoff_logged = True
+        self._land_log_start_mono: Optional[float] = None
+        self._land_log_start_iso: Optional[str] = None
+        self._landing_logged = True
+        self._prev_armed = False
+
+    @staticmethod
+    def _iso_now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _write_csv_header(path: str, header: List[str]) -> None:
+        if not os.path.exists(path):
+            with open(path, "w", newline="") as f:
+                csv.writer(f).writerow(header)
+
+    def _append_csv_row(self, path: str, row: List[object]) -> None:
+        with self._test_log_lock:
+            with open(path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+                f.flush()
+                os.fsync(f.fileno())
+
+    def _log_replanning(self, algorithm_used: str, obstacle_count: int, computation_time_ms: float, path_length_m: float, odi_threshold_used: int) -> None:
+        self._append_csv_row(self._replanning_log_path, [
+            self._iso_now(), algorithm_used, obstacle_count,
+            f"{computation_time_ms:.3f}", f"{path_length_m:.3f}", odi_threshold_used,
+        ])
+
+    def _log_takeoff_landing(self, event_type: str, start_time_iso: str, end_time_iso: str, duration_sec: float, success: bool) -> None:
+        self._append_csv_row(self._takeoff_landing_log_path, [
+            self._iso_now(), event_type, start_time_iso, end_time_iso,
+            f"{duration_sec:.3f}", success,
+        ])
+
+    def _log_trajectory_point(self, x: float, y: float, z: float, source: str) -> None:
+        self._append_csv_row(self._trajectory_log_path, [
+            self._iso_now(), f"{x:.4f}", f"{y:.4f}", f"{z:.4f}", source,
+        ])
+
+    @staticmethod
+    def _path_length_m(points: List[Tuple[float, float]]) -> float:
+        total = 0.0
+        for (x0, y0), (x1, y1) in zip(points, points[1:]):
+            total += math.hypot(x1 - x0, y1 - y0)
+        return total
 
     def takeoff_altitude_cb(self, msg: Float32) -> None:
         """Altitude takeoff dari dashboard, di-clamp agar input UI yang salah
@@ -531,17 +685,33 @@ class DashboardBridgeNode(Node):
             return
 
         parsed: List[Pose2D] = []
+        sources = set()
         for item in raw:
-            try:
-                x = float(item["x"]); y = float(item["y"])
-                z = float(item.get("z", self.takeoff_altitude))
-            except (KeyError, TypeError, ValueError):
-                self.publish_ack("waypoints_nack", seq, 0, "Format waypoint salah (butuh x, y).")
+            if not isinstance(item, dict):
+                self.publish_ack("waypoints_nack", seq, 0, "Entri waypoint harus berupa objek.")
                 return
+
+            x, y, src = self.resolve_waypoint(item)
+            if x is None:
+                self.publish_ack("waypoints_nack", seq, 0, src)
+                return
+            sources.add(src)
+
+            try:
+                z = float(item.get("z", self.takeoff_altitude))
+            except (TypeError, ValueError):
+                self.publish_ack("waypoints_nack", seq, 0, "Altitude waypoint tidak valid.")
+                return
+
             if not (WORLD["x_min"] <= x <= WORLD["x_max"] and WORLD["y_min"] <= y <= WORLD["y_max"]):
-                self.publish_ack("waypoints_nack", seq, 0, f"Waypoint ({x:.1f}, {y:.1f}) di luar batas world.")
+                self.publish_ack(
+                    "waypoints_nack", seq, 0,
+                    f"Waypoint ({x:.1f}, {y:.1f}) di luar batas world.",
+                )
                 return
             parsed.append(Pose2D(x=x, y=y, z=z, yaw=self.current_pose.yaw))
+
+        mode_txt = "GPS (lat/lon)" if "gps" in sources else "jarak lokal (meter)"
 
         with self._path_lock:
             self.path = parsed
@@ -557,7 +727,10 @@ class DashboardBridgeNode(Node):
         self.mission_start_battery = self.battery.get("remaining")
         self.rtl_triggered = False
         self.publish_path()
-        self.publish_ack("waypoints_ack", seq, len(parsed), f"{len(parsed)} waypoint diterima & misi dimulai.")
+        self.publish_ack(
+            "waypoints_ack", seq, len(parsed),
+            f"{len(parsed)} waypoint diterima via {mode_txt} & misi dimulai.",
+        )
 
     def publish_ack(self, event: str, seq: int, count: int, message: str) -> None:
         self.state_pub.publish(String(data=json.dumps({
@@ -599,7 +772,20 @@ class DashboardBridgeNode(Node):
         if remaining is not None and remaining <= self.low_battery_threshold and not self.rtl_triggered: self.trigger_return_home("battery_low")
 
     def vehicle_status_cb(self, msg: VehicleStatus) -> None:
-        self.vehicle_status = {"armed": int(msg.arming_state) == int(VehicleStatus.ARMING_STATE_ARMED), "navState": int(msg.nav_state), "navStateName": self.nav_state_name(int(msg.nav_state)), "failsafe": bool(msg.failsafe), "acceptsOffboard": bool(msg.accepts_offboard_setpoints)}
+        armed_now = int(msg.arming_state) == int(VehicleStatus.ARMING_STATE_ARMED)
+        if (
+            self._land_log_start_mono is not None
+            and not self._landing_logged
+            and self._prev_armed
+            and not armed_now
+        ):
+            self._log_takeoff_landing(
+                "landing", self._land_log_start_iso, self._iso_now(),
+                time.monotonic() - self._land_log_start_mono, True,
+            )
+            self._landing_logged = True
+        self._prev_armed = armed_now
+        self.vehicle_status = {"armed": armed_now, "navState": int(msg.nav_state), "navStateName": self.nav_state_name(int(msg.nav_state)), "failsafe": bool(msg.failsafe), "acceptsOffboard": bool(msg.accepts_offboard_setpoints)}
 
     def wind_cb(self, msg: Wind) -> None:
         speed = math.hypot(float(msg.windspeed_north), float(msg.windspeed_east))
@@ -808,6 +994,9 @@ class DashboardBridgeNode(Node):
             self.sp_z = None
             self.survey_active = False
             self.offboard_requested = True
+            self._takeoff_log_start_mono = time.monotonic()
+            self._takeoff_log_start_iso = self._iso_now()
+            self._takeoff_logged = False
             self.publish_status("auto_takeoff", f"Takeoff otomatis dimulai. Menyalakan mesin (spin-up) selama 1.8 detik...")
 
         if self.mode in ("auto", "return_home"): 
@@ -855,6 +1044,18 @@ class DashboardBridgeNode(Node):
             else:
                 target = self.current_pose
             self.publish_position_setpoint(target, current_cruise_speed=1.5)
+            if (
+                self.mode == "takeoff"
+                and not self._takeoff_logged
+                and self._takeoff_log_start_mono is not None
+                and self.current_pose is not None
+                and self.current_pose.z >= self.takeoff_altitude - 0.3
+            ):
+                self._log_takeoff_landing(
+                    "takeoff", self._takeoff_log_start_iso, self._iso_now(),
+                    time.monotonic() - self._takeoff_log_start_mono, True,
+                )
+                self._takeoff_logged = True
 
         if self.offboard_requested or (self.mode in ("manual", "takeoff", "takeoff_spinup") and self.vehicle_status.get("navState") != 14):
             self.request_offboard_mode()
@@ -942,6 +1143,9 @@ class DashboardBridgeNode(Node):
                 self.sp_x = None
                 self.survey_active = False
                 self.rth_wait_start_time = None
+                self._land_log_start_mono = time.monotonic()
+                self._land_log_start_iso = self._iso_now()
+                self._landing_logged = False
                 self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
                 self.publish_status("rth_complete", "Drone telah tiba di Home Position. Melakukan pendaratan (LAND)...")
                 return
@@ -1135,6 +1339,9 @@ class DashboardBridgeNode(Node):
         else:
             msg.yaw = float("nan")
         msg.yawspeed = float("nan")
+        if self.mode in ("auto", "return_home"):
+            source = "replanning" if self.local_path and self.path_index < len(self.local_path) else "boustrophedon"
+            self._log_trajectory_point(self.sp_x, self.sp_y, self.sp_z, source)
         self.trajectory_pub.publish(msg)
 
     def publish_velocity_setpoint(self, cmd: Twist) -> None:
@@ -1201,12 +1408,18 @@ class DashboardBridgeNode(Node):
         self.sp_x = None
         self.sp_y = None
         self.sp_z = None
+        self._takeoff_log_start_mono = time.monotonic()
+        self._takeoff_log_start_iso = self._iso_now()
+        self._takeoff_logged = False
         self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=float(VehicleCommand.ARMING_ACTION_ARM))
         response.success = True; response.message = f"Takeoff dimulai. Menyalakan mesin (spin-up) selama 1.8 detik..."
         return response
 
     def land_cb(self, _request: Trigger.Request, response: Trigger.Response):
         self.mode = "land"; self.survey_active = False
+        self._land_log_start_mono = time.monotonic()
+        self._land_log_start_iso = self._iso_now()
+        self._landing_logged = False
         self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
         response.success = True; response.message = "PX4 land command dikirim."
         return response
@@ -1297,11 +1510,15 @@ class DashboardBridgeNode(Node):
                 )
 
                 def compute_detour() -> List[Pose2D]:
+                    t_start = time.perf_counter()
                     grid = self.a_star(start_xy, goal_xy) if use_astar else self.rrt(start_xy, goal_xy)
+                    computation_time_ms = (time.perf_counter() - t_start) * 1000.0
                     if not grid:
+                        self._log_replanning(alg_name, obs_count, computation_time_ms, 0.0, 2)
                         return []
                     pruned = self.smooth_path(grid)
                     smoothed = self.bezier_corner_smoothing(pruned, corner_dist=4.0, num_samples=10)
+                    self._log_replanning(alg_name, obs_count, computation_time_ms, self._path_length_m(smoothed), 2)
                     return [Pose2D(x, y, goal_z, goal_yaw) for x, y in smoothed]
 
                 def detour_done(fut) -> None:
@@ -1333,6 +1550,31 @@ class DashboardBridgeNode(Node):
 
         if self.last_goal is None: return
         self.publish_status("replan", f"Menghitung ulang Global Path karena {reason}...")
+
+        # Cabang ini adalah replan RUTE PENUH (dipakai saat tidak ada titik
+        # re-entry aman di global_path). Sama seperti detour lokal di atas, ia
+        # WAJIB tercatat ke replanning_log.csv — tanpa ini seluruh replan tipe
+        # full-reroute hilang dari data pengujian meski statusnya terkirim ke
+        # dashboard. ODI di-snapshot di thread pemanggil karena self.obstacles
+        # bisa berubah saat planner berjalan di executor.
+        global_obs_count = sum(
+            1 for obs in self.obstacles
+            if math.hypot(self.current_pose.x - float(obs["x"]), self.current_pose.y - float(obs["y"])) < 15.0
+        )
+        start_pose, goal_pose = self.current_pose, self.last_goal
+
+        def compute_global() -> List[Pose2D]:
+            t_start = time.perf_counter()
+            result = self.plan_path(start_pose, goal_pose)
+            computation_time_ms = (time.perf_counter() - t_start) * 1000.0
+            # plan_path mengembalikan [] saat A* terjebak; tetap dicatat dengan
+            # panjang 0.0 supaya kegagalan replan ikut terukur, bukan hilang.
+            self._log_replanning(
+                "A* (global)", global_obs_count, computation_time_ms,
+                self._path_length_m([(p.x, p.y) for p in result]), 2,
+            )
+            return result
+
         def done_cb(fut):
             if fut.cancelled(): return
             # FIX BUG #3: atomic update path + path_index
@@ -1343,9 +1585,9 @@ class DashboardBridgeNode(Node):
                 self.path_index = 0
             self.publish_path()
             self.publish_status("replan", f"Global Path siap.")
-            
+
         if self.planning_future and not self.planning_future.done(): self.planning_future.cancel()
-        self.planning_future = self.planning_executor.submit(self.plan_path, self.current_pose, self.last_goal)
+        self.planning_future = self.planning_executor.submit(compute_global)
         self.planning_future.add_done_callback(done_cb)
         self.publish_status("replan", f"Global A* Path replanned karena {reason}.")
 
@@ -2063,7 +2305,17 @@ class DashboardBridgeNode(Node):
             "nearestObstacle": self.nearest_obstacle_m,
             "pathIndex": self.path_index,
             "pathLength": len(self.path),
+            # Koordinat bumi sesungguhnya bila GPS aktif. Saat gpsValid=False
+            # keduanya null, dan dashboard otomatis kembali memakai proyeksi
+            # dari posisi lokal — sehingga drone tanpa GPS tetap tergambar.
+            "gpsValid": self.gps_valid,
         }
+
+        lat, lon = self.pose_to_latlon(pose)
+        if lat is not None:
+            payload["lat"] = round(lat, 7)
+            payload["lon"] = round(lon, 7)
+
         self.telemetry_pub.publish(String(data=json.dumps(payload)))
 
     def snapshot_payload(self) -> Dict[str, object]:
@@ -2092,6 +2344,9 @@ class DashboardBridgeNode(Node):
             "wind": self.wind,
             "nearestObstacle": self.nearest_obstacle_m,
             "rtlTriggered": self.rtl_triggered,
+            "gpsValid": self.gps_valid,
+            "refLat": self.ref_lat,
+            "refLon": self.ref_lon,
             "waypointSeq": self._waypoint_seq,
             "waypointCount": len(self.path),
             "planner": {

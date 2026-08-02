@@ -29,8 +29,15 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { telemetryStore, type TrailPoint, type Waypoint } from "@/lib/telemetryStore";
-import { Cpu, Target, Trees } from "lucide-react";
+import {
+  telemetryStore,
+  type PlannedPathPoint,
+  type TrailPoint,
+  type Waypoint,
+} from "@/lib/telemetryStore";
+import { Cpu, Target, Trees, Navigation, Crosshair } from "lucide-react";
+import { GAZEBO_SPAWN, GAZEBO_TREES } from "@/lib/gazeboWorld";
+import { distanceToTarget, formatDistance } from "@/lib/geo";
 
 const WORLD = {
   xMin: -190,
@@ -38,14 +45,6 @@ const WORLD = {
   yMin: -220,
   yMax: 160,
 };
-
-const GAZEBO_SPAWN = { x: -65.0, y: 0.0 };
-
-const GAZEBO_TREES = [
-  { id: "pohon_sawit_01", name: "🌴 Pohon Sawit 1", x: -40.0, y: 0.0, radius: 4.0, clearance: 2.0 },
-  { id: "pohon_sawit_02", name: "🌴 Pohon Sawit 2", x: -20.0, y: 0.0, radius: 4.0, clearance: 2.0 },
-  { id: "pohon_sawit_03", name: "🌴 Pohon Sawit 3", x: 0.0, y: 0.0, radius: 4.0, clearance: 2.0 },
-];
 
 const FIELDS = [
   { name: "🌾 Sawah Kiri (Plot A)", x: -175, y: -145, w: 220, h: 290, color: "#163f29" },
@@ -119,6 +118,7 @@ interface Props {
   waypoints?: Waypoint[];
   connected: boolean;
   onSetTargetWaypoint?: (wp: Waypoint | null) => void;
+  onSendGoal?: (wp: Waypoint) => void;
   onClearWaypoints?: () => void;
 }
 
@@ -126,20 +126,36 @@ function GazeboMapViewImpl({
   waypoints = [],
   connected,
   onSetTargetWaypoint,
+  onSendGoal,
   onClearWaypoints,
 }: Props) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const coordsRef = useRef<HTMLSpanElement | null>(null);
+  // Label jarak diperbarui secara IMPERATIF dari loop rAF (sama seperti label
+  // koordinat): drone bergerak 20Hz, dan me-render ulang React setiap kali
+  // hanya untuk satu angka adalah pemborosan yang sudah dihindari di sini.
+  const chipDistanceRef = useRef<HTMLSpanElement | null>(null);
+  const tooltipRef = useRef<HTMLDivElement | null>(null);
+  const tooltipDistanceRef = useRef<HTMLSpanElement | null>(null);
   const size = useCanvasSize(wrapRef);
 
   const targetWp = waypoints.length > 0 ? waypoints[waypoints.length - 1] : null;
   // Simpan goal & status koneksi di ref supaya loop rAF membacanya tanpa
   // perlu dipasang ulang saat props berubah.
-  const goalRef = useRef<{ x: number; y: number } | null>(null);
+  const goalRef = useRef<{ x: number; y: number; z: number } | null>(null);
   const connectedRef = useRef(connected);
-  goalRef.current = targetWp ? { x: targetWp.x, y: targetWp.y } : null;
+  goalRef.current = targetWp ? { x: targetWp.x, y: targetWp.y, z: targetWp.z } : null;
+  // Garis rute hanya digambar setelah perintah benar-benar dikirim ("Send
+  // Goal") dan tidak ditolak — bukan saat marker baru dipasang.
+  const routeActiveRef = useRef(false);
+  routeActiveRef.current = Boolean(targetWp?.sent && !targetWp.rejected);
   connectedRef.current = connected;
+
+  /** true selama kursor berada di atas marker goal kuning. */
+  const [goalHovered, setGoalHovered] = useState(false);
+  const goalHoveredRef = useRef(false);
+  goalHoveredRef.current = goalHovered;
 
   // ---------------------------------------------------------------------------
   // Layer statis: dirender sekali per perubahan ukuran
@@ -190,6 +206,7 @@ function GazeboMapViewImpl({
 
       const live = telemetryStore.live;
       const trail = telemetryStore.getLiveTrail();
+      const plannedPath = telemetryStore.getPlannedPathSnapshot();
       const hasFix = connectedRef.current && (live.x !== 0 || live.y !== 0);
       const droneX = hasFix ? live.x : GAZEBO_SPAWN.x;
       const droneY = hasFix ? live.y : GAZEBO_SPAWN.y;
@@ -197,9 +214,16 @@ function GazeboMapViewImpl({
 
       // Dirty check: lewati frame kalau tidak ada yang berubah secara visual.
       // Saat drone hover, ini menurunkan pemakaian CPU ke ~nol.
+      // `goalHoveredRef` ikut masuk key: saat tooltip baru muncul, frame WAJIB
+      // dirender sekali supaya label jaraknya langsung terisi, bukan kosong
+      // sampai drone kebetulan bergerak.
       const key = `${droneX.toFixed(2)}|${droneY.toFixed(2)}|${live.yaw.toFixed(3)}|${
         trail.length
-      }|${goal ? `${goal.x},${goal.y}` : "-"}`;
+      }|${goal ? `${goal.x},${goal.y}` : "-"}|p${plannedPath.length}${
+        plannedPath.length > 0
+          ? `:${plannedPath[0].x},${plannedPath[0].y}`
+          : ""
+      }|h${goalHoveredRef.current ? 1 : 0}|r${routeActiveRef.current ? 1 : 0}`;
       if (key === lastKey && !firstFrame) return;
       lastKey = key;
       firstFrame = false;
@@ -207,7 +231,13 @@ function GazeboMapViewImpl({
       // Blit layer statis (1 operasi) alih-alih menggambar ulang dunia.
       ctx.drawImage(staticLayer, 0, 0, size.width, size.height);
 
+      // Rute survei terencana digambar PALING BAWAH supaya trail aktual & drone
+      // tetap terlihat di atasnya saat drone mulai menyusuri jalur.
+      drawPlannedPath(ctx, transform, plannedPath);
       drawTrail(ctx, transform, trail);
+      if (goal && routeActiveRef.current) {
+        drawRouteLine(ctx, transform, droneX, droneY, goal);
+      }
       drawGoal(ctx, transform, goal);
       drawDrone(ctx, transform, droneX, droneY, live.yaw);
 
@@ -215,6 +245,18 @@ function GazeboMapViewImpl({
       // murah daripada memicu render React 20x/detik hanya untuk dua angka.
       const label = coordsRef.current;
       if (label) label.textContent = `X: ${droneX.toFixed(2)}m  |  Y: ${droneY.toFixed(2)}m`;
+
+      // Jarak drone -> waypoint kuning, SELALU meter. Ikut jalur imperatif yang
+      // sama supaya angka tetap live tanpa render ulang React.
+      if (goal) {
+        const d = distanceToTarget(
+          { x: droneX, y: droneY, z: live.z, lat: live.lat, lon: live.lon, gpsValid: live.gpsValid },
+          goal
+        );
+        const text = formatDistance(d.horizontalM);
+        if (chipDistanceRef.current) chipDistanceRef.current.textContent = text;
+        if (tooltipDistanceRef.current) tooltipDistanceRef.current.textContent = text;
+      }
     };
 
     render();
@@ -248,6 +290,41 @@ function GazeboMapViewImpl({
     [onClearWaypoints]
   );
 
+  /** Radius (piksel) di sekitar marker goal yang dianggap "hover". */
+  const GOAL_HIT_RADIUS_PX = 16;
+
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      const goal = goalRef.current;
+      if (!goal) {
+        if (goalHoveredRef.current) setGoalHovered(false);
+        return;
+      }
+
+      const rect = e.currentTarget.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+
+      const transform = makeTransform(size.width, size.height);
+      const gx = transform.toScreenX(goal.x);
+      const gy = transform.toScreenY(goal.y);
+      const over = Math.hypot(mx - gx, my - gy) <= GOAL_HIT_RADIUS_PX;
+
+      // Posisi tooltip ditulis langsung ke style — mousemove terlalu sering
+      // untuk dijadikan state React.
+      if (over && tooltipRef.current) {
+        tooltipRef.current.style.left = `${gx}px`;
+        tooltipRef.current.style.top = `${gy - 14}px`;
+      }
+      if (over !== goalHoveredRef.current) setGoalHovered(over);
+    },
+    [size.width, size.height]
+  );
+
+  const handleMouseLeave = useCallback(() => {
+    if (goalHoveredRef.current) setGoalHovered(false);
+  }, []);
+
   return (
     <div
       className="relative w-full h-[560px] rounded-2xl overflow-hidden glass-panel border border-slate-700/60 shadow-2xl flex flex-col bg-[#070b12]"
@@ -270,7 +347,28 @@ function GazeboMapViewImpl({
         ref={canvasRef}
         onClick={handleClick}
         onDoubleClick={handleDoubleClick}
+        onMouseMove={handleMouseMove}
+        onMouseLeave={handleMouseLeave}
       />
+
+      {/* Tooltip hover marker goal kuning: jarak drone -> waypoint (meter). */}
+      {targetWp && goalHovered && (
+        <div
+          ref={tooltipRef}
+          className="absolute z-20 -translate-x-1/2 -translate-y-full pointer-events-none glass-panel px-2.5 py-1.5 rounded-lg border border-amber-400/70 bg-slate-900/95 shadow-xl whitespace-nowrap"
+        >
+          <div className="flex items-center gap-1.5 text-[11px] font-bold text-amber-300">
+            <Crosshair className="w-3 h-3" />
+            Jarak ke waypoint
+          </div>
+          <div className="font-mono text-sm font-bold text-white leading-tight">
+            <span ref={tooltipDistanceRef}>-</span>
+          </div>
+          <div className="font-mono text-[10px] text-slate-400">
+            ({targetWp.x.toFixed(1)}, {targetWp.y.toFixed(1)}) • alt {targetWp.z.toFixed(1)} m
+          </div>
+        </div>
+      )}
 
       <div className="absolute bottom-4 left-4 z-10 glass-panel px-3 py-1.5 rounded-lg border border-slate-700/80 text-xs flex items-center gap-3 text-slate-300">
         <Target className="w-3.5 h-3.5 text-cyan-400" />
@@ -279,6 +377,29 @@ function GazeboMapViewImpl({
         </span>
         <span className="text-slate-600">|</span>
         <span className="text-[10px] text-slate-400">Spawn Home: (-65.0, 0.0)</span>
+      </div>
+
+      {/* Target + Send Goal: kirim marker kuning ke planner A* penghindar rintangan. */}
+      <div className="absolute bottom-4 right-4 z-10 flex items-center gap-2">
+        {targetWp && (
+          <div className="glass-panel px-3 py-1.5 rounded-lg border border-amber-500/50 bg-amber-500/10 text-xs flex items-center gap-2 text-amber-200">
+            <Crosshair className="w-3.5 h-3.5" />
+            <span className="font-mono">
+              Goal: {targetWp.x.toFixed(1)}, {targetWp.y.toFixed(1)}
+            </span>
+            <span className="text-amber-500/50">|</span>
+            <span className="font-mono font-bold text-amber-100">
+              <span ref={chipDistanceRef}>-</span>
+            </span>
+          </div>
+        )}
+        <button
+          onClick={() => targetWp && onSendGoal?.(targetWp)}
+          disabled={!connected || !targetWp}
+          className="flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold text-xs shadow-lg transition-all border border-cyan-400/30"
+        >
+          <Navigation className="w-4 h-4" /> Send Goal
+        </button>
       </div>
     </div>
   );
@@ -407,6 +528,46 @@ function drawSpawnPoint(ctx: CanvasRenderingContext2D, transform: Transform) {
   ctx.fillText("🏠 Gazebo Spawn (-65, 0)", px - 55, py + 22);
 }
 
+function drawPlannedPath(
+  ctx: CanvasRenderingContext2D,
+  transform: Transform,
+  path: PlannedPathPoint[]
+) {
+  if (path.length < 2) return;
+
+  // Garis putus-putus rute survei (boustrophedon / A*).
+  ctx.strokeStyle = "rgba(56, 189, 248, 0.85)";
+  ctx.lineWidth = 2;
+  ctx.setLineDash([8, 6]);
+  ctx.beginPath();
+  ctx.moveTo(transform.toScreenX(path[0].x), transform.toScreenY(path[0].y));
+  for (let i = 1; i < path.length; i++) {
+    ctx.lineTo(transform.toScreenX(path[i].x), transform.toScreenY(path[i].y));
+  }
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Titik belok waypoint supaya pola lawnmower terbaca jelas.
+  ctx.fillStyle = "#38bdf8";
+  for (let i = 0; i < path.length; i++) {
+    ctx.beginPath();
+    ctx.arc(transform.toScreenX(path[i].x), transform.toScreenY(path[i].y), 2.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Tandai titik START (hijau) & END (merah) rute.
+  const first = path[0];
+  const last = path[path.length - 1];
+  ctx.fillStyle = "#34d399";
+  ctx.beginPath();
+  ctx.arc(transform.toScreenX(first.x), transform.toScreenY(first.y), 4.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#f87171";
+  ctx.beginPath();
+  ctx.arc(transform.toScreenX(last.x), transform.toScreenY(last.y), 4.5, 0, Math.PI * 2);
+  ctx.fill();
+}
+
 function drawTrail(ctx: CanvasRenderingContext2D, transform: Transform, trail: TrailPoint[]) {
   if (trail.length < 2) return;
   ctx.strokeStyle = "rgba(6, 182, 212, 0.8)";
@@ -417,6 +578,33 @@ function drawTrail(ctx: CanvasRenderingContext2D, transform: Transform, trail: T
     ctx.lineTo(transform.toScreenX(trail[i].x), transform.toScreenY(trail[i].y));
   }
   ctx.stroke();
+}
+
+/**
+ * Garis putus-putus drone -> tujuan, menandakan drone sedang menuju ke sana.
+ *
+ * Digambar SEBELUM marker goal & ikon drone supaya kedua ujungnya tertutup
+ * rapi oleh simbol, bukan menimpanya.
+ */
+function drawRouteLine(
+  ctx: CanvasRenderingContext2D,
+  transform: Transform,
+  droneX: number,
+  droneY: number,
+  goal: { x: number; y: number }
+) {
+  ctx.save();
+  ctx.strokeStyle = "#fbbf24";
+  ctx.lineWidth = 2;
+  ctx.globalAlpha = 0.9;
+  ctx.setLineDash([8, 8]);
+  ctx.beginPath();
+  ctx.moveTo(transform.toScreenX(droneX), transform.toScreenY(droneY));
+  ctx.lineTo(transform.toScreenX(goal.x), transform.toScreenY(goal.y));
+  ctx.stroke();
+  // setLineDash bersifat lengket pada context; restore() mengembalikannya
+  // supaya elemen berikutnya tidak ikut tergambar putus-putus.
+  ctx.restore();
 }
 
 function drawGoal(

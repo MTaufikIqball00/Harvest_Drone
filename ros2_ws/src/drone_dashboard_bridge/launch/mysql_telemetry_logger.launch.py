@@ -8,10 +8,10 @@ def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument("db_host", default_value=EnvironmentVariable("DRONE_DB_HOST", default_value="127.0.0.1")),
-            DeclareLaunchArgument("db_port", default_value=EnvironmentVariable("DRONE_DB_PORT", default_value="3306")),
-            DeclareLaunchArgument("db_user", default_value=EnvironmentVariable("DRONE_DB_USER", default_value="drone_app")),
+            DeclareLaunchArgument("db_port", default_value=EnvironmentVariable("DRONE_DB_PORT", default_value="5432")),
+            DeclareLaunchArgument("db_user", default_value=EnvironmentVariable("DRONE_DB_USER", default_value="postgres")),
             DeclareLaunchArgument("db_password", default_value=EnvironmentVariable("DRONE_DB_PASSWORD", default_value="")),
-            DeclareLaunchArgument("db_name", default_value=EnvironmentVariable("DRONE_DB_NAME", default_value="drone_ops")),
+            DeclareLaunchArgument("db_name", default_value=EnvironmentVariable("DRONE_DB_NAME", default_value="postgres")),
             DeclareLaunchArgument("drone_id", default_value=EnvironmentVariable("DRONE_DB_DRONE_ID", default_value="1")),
             DeclareLaunchArgument("mission_id", default_value=EnvironmentVariable("DRONE_DB_MISSION_ID", default_value="0")),
             Node(

@@ -1,160 +1,210 @@
-# Dokumentasi Skema Relasi Database: Autonomous Drone System
+# Dokumentasi Skema Relasi Database: Drone Stack (Modul Drone)
 
-Sistem ini menggunakan arsitektur relasional untuk mengelola data operasional drone, misi penerbangan, dan log telemetri real-time yang dihasilkan oleh integrasi ROS 2 Jazzy, PX4 Autopilot, dan Gazebo Harmonic.
+Dokumen ini menggambarkan skema relasional untuk sisi **operasional drone**
+saja — akun, inventaris drone, misi penerbangan, dan lima jalur logging
+real-time. Modul klasifikasi panen & AI geospasial (`field_boundaries`,
+`harvest_jobs`, `harvest_classifications`, `image_metadata`) sengaja
+dikeluarkan dari cakupan diagram ini.
+
+Sumber: [`database/drone_schema.sql`](../database/drone_schema.sql) (MySQL,
+sumber utama), port 1:1 di
+[`database/supabase_schema.sql`](../database/supabase_schema.sql) (PostgreSQL).
 
 ## 1. ER Diagram (Mermaid.js)
 
-Berikut adalah visualisasi hubungan antar tabel menggunakan Mermaid.js.
-
 ```mermaid
 erDiagram
-    USERS ||--o{ FLIGHT_MISSIONS : "executes"
-    USERS ||--o{ SYSTEM_ACTIVITY_LOGS : "performs"
-    DRONES ||--o{ FLIGHT_MISSIONS : "assigned_to"
-    
-    FLIGHT_MISSIONS ||--o{ TELEMETRY_LOGS : "logs"
-    FLIGHT_MISSIONS ||--o{ BATTERY_LOGS : "monitors"
-    FLIGHT_MISSIONS ||--o{ OBSTACLE_LOGS : "detects"
-    FLIGHT_MISSIONS ||--o{ SENSOR_LOGS : "captures"
-    FLIGHT_MISSIONS ||--o{ WIND_LOGS : "measures"
-    FLIGHT_MISSIONS ||--o{ PATH_PLANNING_LOGS : "follows"
-    FLIGHT_MISSIONS ||--o{ MANUAL_CONTROL_LOGS : "records"
-    FLIGHT_MISSIONS ||--o{ ERROR_LOGS : "reports"
-    FLIGHT_MISSIONS ||--o{ RETURN_TO_HOME_LOGS : "triggers"
-    FLIGHT_MISSIONS ||--|| AUTONOMOUS_RESULTS : "concludes"
+    USERS ||--o{ MISSIONS : "operates"
+    DRONES ||--o{ MISSIONS : "flies"
+
+    DRONES ||--o{ TELEMETRY_LOGS : "reports"
+    DRONES ||--o{ BATTERY_LOGS : "reports"
+    DRONES ||--o{ WIND_LOGS : "reports"
+    DRONES ||--o{ OBSTACLE_LOGS : "detects"
+    DRONES ||--o{ ERROR_LOGS : "raises"
+
+    MISSIONS ||--o{ TELEMETRY_LOGS : "logs"
+    MISSIONS ||--o{ BATTERY_LOGS : "logs"
+    MISSIONS ||--o{ WIND_LOGS : "logs"
+    MISSIONS ||--o{ OBSTACLE_LOGS : "logs"
+    MISSIONS ||--o{ ERROR_LOGS : "logs"
 
     USERS {
-        bigint id PK
-        string name
-        string email
-        string password
-        enum role
+        int id PK
+        string username UK
+        string password_hash
+        enum role "admin|operator|viewer"
         timestamp created_at
-        timestamp updated_at
     }
 
     DRONES {
-        bigint id PK
-        string drone_name
+        int id PK
+        string name
         string model
-        string serial_number
-        enum status
+        enum status "active|maintenance|retired"
         timestamp created_at
     }
 
-    FLIGHT_MISSIONS {
-        bigint id PK
-        bigint user_id FK
-        bigint drone_id FK
-        string mission_name
-        datetime start_time
-        datetime end_time
-        enum flight_mode
-        enum status
-        timestamp created_at
+    MISSIONS {
+        int id PK
+        int drone_id FK
+        int operator_id FK
+        timestamp start_time
+        timestamp end_time
+        float start_x
+        float start_y
+        float dest_x
+        float dest_y
+        string flight_mode
+        float goal_distance_m
+        string goal_distance_source
+        float total_distance_m
+        float battery_used_percent
+        enum status "planned|in_progress|completed|failed|aborted"
+        timestamp arrival_time
+        timestamp rth_start_time
+        timestamp landing_time
+        int total_duration_sec
     }
 
     TELEMETRY_LOGS {
         bigint id PK
-        bigint mission_id FK
+        int mission_id FK "nullable"
+        int drone_id FK
+        timestamp recorded_at
+        float x
+        float y
+        float z
         double latitude
         double longitude
-        float altitude
-        float roll
-        float pitch
-        float yaw
+        float altitude_m
         float velocity_x
         float velocity_y
         float velocity_z
-        timestamp log_time
+        float speed_mps
+        float yaw_rad
+        float pitch_rad
+        float roll_rad
+        float heading_deg
+        string flight_mode
+        string nav_state
+        string source
+        json raw_payload
     }
 
     BATTERY_LOGS {
         bigint id PK
-        bigint mission_id FK
-        float voltage
-        float current
-        float percentage
-        float temperature
-        timestamp log_time
+        int mission_id FK "nullable"
+        int drone_id FK
+        timestamp recorded_at
+        float battery_percent
+        float voltage_v
+        float current_a
+        float estimated_remaining_sec
+        string warning_level
+        json raw_payload
+    }
+
+    WIND_LOGS {
+        bigint id PK
+        int mission_id FK "nullable"
+        int drone_id FK
+        timestamp recorded_at
+        float wind_speed_mps
+        float wind_direction_deg
+        float wind_north_mps
+        float wind_east_mps
+        string safety_status
+        json raw_payload
     }
 
     OBSTACLE_LOGS {
         bigint id PK
-        bigint mission_id FK
-        string sensor_id
-        float distance
-        float angle
-        timestamp log_time
+        string obstacle_uid
+        int mission_id FK "nullable"
+        int drone_id FK
+        timestamp detected_at
+        float x
+        float y
+        float z
+        double latitude
+        double longitude
+        float radius_m
+        float width_m
+        float height_m
+        string obstacle_type
+        string source
+        float confidence
+        string avoidance_action
+        json raw_payload
     }
 
-    AUTONOMOUS_RESULTS {
+    ERROR_LOGS {
         bigint id PK
-        bigint mission_id FK
-        float success_rate
-        float total_distance
-        integer duration_seconds
-        string algorithm_name
-        text summary
+        int mission_id FK "nullable"
+        int drone_id FK
+        timestamp occurred_at
+        enum severity "info|warning|error|critical"
+        string subsystem
+        string event_type
+        string error_code
+        text message
+        json context
+        timestamp resolved_at
     }
 ```
 
----
-
 ## 2. Detail Spesifikasi Tabel
 
-### A. Tabel Core (Master Data)
+### A. Master Data
 
-| Nama Tabel | Atribut (Kolom) | Tipe Data | Constraint | Deskripsi |
-| :--- | :--- | :--- | :--- | :--- |
-| **users** | id, name, email, password, role, created_at, updated_at | BIGINT, VARCHAR, ENUM | PK, Unique (email) | Data pengguna/pilot dashboard. |
-| **drones** | id, drone_name, model, serial_number, status, created_at | BIGINT, VARCHAR, ENUM | PK, Unique (SN) | Inventaris unit drone PX4. |
-| **flight_missions** | id, user_id, drone_id, mission_name, start_time, end_time, flight_mode, status | BIGINT, DATETIME, ENUM | PK, FK_users, FK_drones | Header data sesi penerbangan. |
+| Tabel | Kolom Kunci | Constraint | Deskripsi |
+| :--- | :--- | :--- | :--- |
+| **users** | `id` PK, `username` UNIQUE, `role` ENUM | — | Akun operator/admin dashboard. |
+| **drones** | `id` PK, `status` ENUM | — | Inventaris unit drone. |
 
-### B. Tabel Telemetri & Sensor (High-Volume Data)
+### B. Transaksi Misi
 
-| Nama Tabel | Atribut Utama | Tipe Data | Relasi | Deskripsi |
-| :--- | :--- | :--- | :--- | :--- |
-| **telemetry_logs** | latitude, longitude, altitude, roll, pitch, yaw, velocity | DOUBLE, FLOAT | FK (mission_id) | Log posisi dan orientasi dari PX4. |
-| **battery_logs** | voltage, current, percentage, temperature | FLOAT | FK (mission_id) | Monitoring status daya real-time. |
-| **obstacle_logs** | sensor_id, distance, angle | FLOAT, VARCHAR | FK (mission_id) | Data deteksi dari sensor LiDAR/Ultrasonic. |
-| **sensor_logs** | sensor_type, raw_data, status | VARCHAR, JSON | FK (mission_id) | Data mentah sensor lainnya (IMU, Mag, dll). |
-| **wind_logs** | wind_speed, direction | FLOAT | FK (mission_id) | Estimasi kondisi angin saat terbang. |
+| Tabel | Relasi | Deskripsi |
+| :--- | :--- | :--- |
+| **missions** | `drone_id` → drones (CASCADE), `operator_id` → users (SET NULL) | Header sesi penerbangan: titik awal/tujuan, jarak, baterai terpakai, status, timestamp RTH/landing. |
 
-### C. Tabel Navigasi & Kontrol
+### C. Logging Real-Time (High-Volume)
 
-| Nama Tabel | Atribut Utama | Tipe Data | Relasi | Deskripsi |
-| :--- | :--- | :--- | :--- | :--- |
-| **path_planning_logs** | waypoint_lat, waypoint_lon, alt, sequence | DOUBLE, INT | FK (mission_id) | Log rute yang direncanakan vs aktual. |
-| **manual_control_logs** | input_source, throttle, roll, pitch, yaw | VARCHAR, FLOAT | FK (mission_id) | Rekaman input jika pilot mengambil alih. |
-| **return_to_home_logs** | trigger_reason, home_lat, home_lon, land_time | TEXT, DOUBLE | FK (mission_id) | Log prosedur emergency/RTH. |
+| Tabel | Relasi | Deskripsi |
+| :--- | :--- | :--- |
+| **telemetry_logs** | `mission_id` (nullable, CASCADE), `drone_id` (CASCADE) | Posisi, kecepatan, orientasi (indexed by `mission_id, recorded_at`). |
+| **battery_logs** | `mission_id`, `drone_id` (CASCADE) | Persentase baterai, tegangan, arus, estimasi sisa waktu. |
+| **wind_logs** | `mission_id`, `drone_id` (CASCADE) | Kecepatan & arah angin, status keamanan terbang. |
+| **obstacle_logs** | `mission_id`, `drone_id` (CASCADE) | Deteksi rintangan (LiDAR/vision), aksi penghindaran. |
+| **error_logs** | `mission_id`, `drone_id` (CASCADE) | Log error/warning subsistem (ROS 2, PX4). |
 
-### D. Tabel Analitik & Sistem
-
-| Nama Tabel | Atribut Utama | Tipe Data | Relasi | Deskripsi |
-| :--- | :--- | :--- | :--- | :--- |
-| **autonomous_results** | success_rate, duration, algorithm_used | FLOAT, TEXT | FK (mission_id) | Hasil akhir analisis misi (1:1 per misi). |
-| **error_logs** | error_code, message, severity | VARCHAR, ENUM | FK (mission_id) | Log malfungsi hardware/software (ROS 2). |
-| **system_activity_logs**| user_id, action, description, ip_address | BIGINT, TEXT | FK (user_id) | Audit trail aktivitas user di dashboard. |
-
----
+`mission_id` nullable di semua tabel log ini karena beberapa data (mis.
+telemetry saat idle) bisa direkam di luar konteks misi aktif.
 
 ## 3. Penjelasan Hubungan (Relationships)
 
-1.  **One-to-Many (1:N):**
-    *   **User -> Mission:** Satu pilot dapat mengeksekusi banyak misi penerbangan.
-    *   **Drone -> Mission:** Satu drone dapat digunakan untuk berbagai misi di waktu yang berbeda.
-    *   **Mission -> Logs (Telemetry, Battery, etc):** Satu sesi misi menghasilkan ribuan baris data log. Ini memungkinkan tracking performa per detik melalui dashboard Next.js.
-2.  **One-to-One (1:1):**
-    *   **Mission -> Autonomous Results:** Setiap misi yang selesai akan diproses untuk menghasilkan satu laporan kesimpulan performa otonom.
-3.  **Many-to-Many (M:N):**
-    *   Dalam skema ini, relasi M:N antara User dan Drone dijembatani oleh tabel `flight_missions` (sehingga menjadi dua relasi 1:N) untuk menjaga normalisasi 3NF.
+1. **One-to-Many (1:N):**
+   - `users → missions`: satu operator bisa menjalankan banyak misi (`operator_id`, `ON DELETE SET NULL` — misi tetap ada walau user dihapus).
+   - `drones → missions`: satu drone dipakai di banyak misi (`ON DELETE CASCADE`).
+   - `drones/missions → telemetry_logs|battery_logs|wind_logs|obstacle_logs|error_logs`: satu misi/drone menghasilkan ribuan baris log.
+2. **Tidak ada relasi Many-to-Many** eksplisit dalam skema ini — relasi N:N potensial (mis. drone bisa dipakai banyak operator) sudah dinormalisasi lewat tabel `missions` sebagai penghubung.
 
----
+> Modul klasifikasi panen & AI geospasial (`field_boundaries`, `harvest_jobs`,
+> `harvest_classifications`, `image_metadata`) didokumentasikan terpisah —
+> lihat riwayat sebelumnya di file ini atau `database/drone_schema.sql`
+> bagian 4 jika dibutuhkan lagi.
 
-## 4. Tips Implementasi untuk Dashboard Next.js & ROS 2
+## 4. Cara Regenerasi Diagram
 
-*   **Indexing:** Pastikan kolom `mission_id` dan `log_time` pada tabel log diberikan **Index** untuk mempercepat query grafik real-time di Next.js.
-*   **Data Partitioning:** Karena tabel `telemetry_logs` akan tumbuh sangat cepat (high frequency), pertimbangkan menggunakan teknik *table partitioning* berdasarkan bulan atau `mission_id` di MySQL.
-*   **Bridge Connection:** Gunakan Python script (dengan `mysql-connector-python`) di sisi ROS 2 yang melakukan *subscribe* ke topik `/fmu/out/vehicle_gps_position` dan `/fmu/out/battery_status`, lalu melakukan `INSERT` ke database ini.
-*   **JSON Support:** Tabel `sensor_logs` menggunakan tipe data **JSON** agar fleksibel jika Anda menambahkan sensor baru tanpa harus mengubah struktur tabel.
+Skema Mermaid di atas adalah "kode"-nya — render di GitHub (otomatis), VS
+Code (ekstensi Markdown Preview Mermaid), atau [mermaid.live](https://mermaid.live).
+Sumber kebenaran struktur tabel tetap file DDL:
+
+```bash
+# MySQL (lokal)
+mysql -u root -p < database/drone_schema.sql
+
+# PostgreSQL/Supabase
+psql "$SUPABASE_DB_URL" -f database/supabase_schema.sql
+```

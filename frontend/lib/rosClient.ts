@@ -331,5 +331,18 @@ export function getRosClient(url: string): RosClient {
   return client;
 }
 
-export const DEFAULT_ROSBRIDGE_URL =
-  process.env.NEXT_PUBLIC_ROSBRIDGE_URL || "ws://127.0.0.1:9090";
+function resolveDefaultRosbridgeUrl(): string {
+  if (process.env.NEXT_PUBLIC_ROSBRIDGE_URL) {
+    return process.env.NEXT_PUBLIC_ROSBRIDGE_URL;
+  }
+  // Tanpa env var, ikuti host yang dipakai browser membuka dashboard
+  // (mis. IP laptop di LAN) alih-alih hardcode 127.0.0.1 — hardcode itu
+  // selalu berarti "localhost milik si browser", jadi patah begitu
+  // dashboard dibuka dari perangkat lain (HP, laptop lain di LAN).
+  if (typeof window !== "undefined" && window.location.hostname) {
+    return `ws://${window.location.hostname}:9090`;
+  }
+  return "ws://127.0.0.1:9090";
+}
+
+export const DEFAULT_ROSBRIDGE_URL = resolveDefaultRosbridgeUrl();

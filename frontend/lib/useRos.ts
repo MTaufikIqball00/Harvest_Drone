@@ -32,15 +32,37 @@ import {
 import {
   DEFAULT_TELEMETRY,
   telemetryStore,
+  type ObstacleMarker,
+  type PlannedPathPoint,
   type TelemetryData,
   type TrailPoint,
   type VehicleState,
   type Waypoint,
 } from "./telemetryStore";
 
-export type { TelemetryData, Waypoint, TrailPoint, VehicleState };
+export type { TelemetryData, Waypoint, TrailPoint, VehicleState, PlannedPathPoint, ObstacleMarker };
 
 const TRIGGER = "std_srvs/srv/Trigger";
+
+/**
+ * Snapshot server untuk slice yang berupa array kosong.
+ *
+ * WAJIB konstanta modul, BUKAN `() => []` inline. useSyncExternalStore
+ * membandingkan hasil getServerSnapshot dengan ===; literal `[]` inline
+ * menghasilkan array BARU tiap pemanggilan sehingga perbandingan selalu gagal,
+ * React menganggap store berubah terus, lalu memperingatkan "The result of
+ * getServerSnapshot should be cached to avoid an infinite loop".
+ *
+ * Dibekukan supaya tidak ada konsumen yang tanpa sadar memutasinya — satu
+ * instance ini dipakai bersama oleh semua hook di bawah.
+ */
+const EMPTY_TRAIL: readonly TrailPoint[] = Object.freeze([]);
+const EMPTY_PLANNED_PATH: readonly PlannedPathPoint[] = Object.freeze([]);
+const EMPTY_OBSTACLES: readonly ObstacleMarker[] = Object.freeze([]);
+
+const getEmptyTrail = () => EMPTY_TRAIL as TrailPoint[];
+const getEmptyPlannedPath = () => EMPTY_PLANNED_PATH as PlannedPathPoint[];
+const getEmptyObstacles = () => EMPTY_OBSTACLES as ObstacleMarker[];
 
 // -----------------------------------------------------------------------------
 // Selector hooks — komponen hanya berlangganan slice yang dibutuhkannya
@@ -69,7 +91,27 @@ export function useFlightTrail(): TrailPoint[] {
   return useSyncExternalStore(
     telemetryStore.subscribeTrail,
     telemetryStore.getTrailSnapshot,
-    () => [] as TrailPoint[]
+    getEmptyTrail
+  );
+}
+
+/** Rute misi terencana (mis. jalur boustrophedon auto survey). Frekuensi
+ *  rendah — hanya berubah saat misi baru dimulai/dihapus. */
+export function usePlannedPath(): PlannedPathPoint[] {
+  return useSyncExternalStore(
+    telemetryStore.subscribePlannedPath,
+    telemetryStore.getPlannedPathSnapshot,
+    getEmptyPlannedPath
+  );
+}
+
+/** Daftar rintangan aktif (pohon SDF + deteksi LiDAR). Frekuensi rendah (2Hz) —
+ *  dipakai bar ODI untuk mengenali rintangan mana yang sedang dihindari. */
+export function useObstacles(): ObstacleMarker[] {
+  return useSyncExternalStore(
+    telemetryStore.subscribeObstacles,
+    telemetryStore.getObstaclesSnapshot,
+    getEmptyObstacles
   );
 }
 
@@ -125,6 +167,34 @@ export function useRos(wsUrl: string = DEFAULT_ROSBRIDGE_URL) {
             flightMode: data.flightMode,
             navState: data.navState,
             stampMs: data.stamp_ms,
+            // Jarak rintangan terdekat (LiDAR) — bisa null bila tidak ada.
+            nearestObstacle:
+              data.nearestObstacle === null || typeof data.nearestObstacle === "number"
+                ? data.nearestObstacle
+                : undefined,
+            // lat/lon hanya dikirim node saat GPS fix; kalau tidak ada,
+            // store mempertahankan proyeksi lokal sebagai fallback.
+            lat: typeof data.lat === "number" ? data.lat : undefined,
+            lon: typeof data.lon === "number" ? data.lon : undefined,
+            gpsValid: Boolean(data.gpsValid),
+            // PENTING: TIDAK di-coerce ke Boolean() seperti gpsValid. Node
+            // ArduPilot/PX4 tidak pernah mengirim field ini sama sekali, jadi
+            // Boolean(undefined) akan selalu jadi false dan menyembunyikan
+            // ARM/DISARM yang seharusnya tetap tampil untuk stack itu. Hanya
+            // diteruskan saat node (mis. jembatan DJI) benar-benar mengirim
+            // nilai eksplisit — telemetryStore lalu mempertahankan default
+            // true selama field ini tidak pernah muncul.
+            armDisarmSupported:
+              typeof data.armDisarmSupported === "boolean"
+                ? data.armDisarmSupported
+                : undefined,
+            // Pola sama: hanya diteruskan saat eksplisit ada, supaya node
+            // ArduPilot/PX4 yang tidak pernah mengirim field ini tetap
+            // mempertahankan default true (fitur lanjutan tetap tampil).
+            advancedFeaturesSupported:
+              typeof data.advancedFeaturesSupported === "boolean"
+                ? data.advancedFeaturesSupported
+                : undefined,
           });
         } catch (err) {
           console.warn("[useRos] Payload telemetry tidak bisa diparse:", err);
@@ -146,6 +216,51 @@ export function useRos(wsUrl: string = DEFAULT_ROSBRIDGE_URL) {
           }
         } catch (err) {
           console.warn("[useRos] Payload state tidak bisa diparse:", err);
+        }
+      }
+    );
+
+    // Rute misi terencana (boustrophedon auto survey, dll) — frekuensi rendah,
+    // hanya diterbitkan node saat rute baru dihitung.
+    const unsubPaths = client.subscribe(
+      "/dashboard/paths_json",
+      "std_msgs/msg/String",
+      (message: any) => {
+        try {
+          const payload = JSON.parse(message.data);
+          const final = Array.isArray(payload?.final) ? payload.final : [];
+          telemetryStore.ingestPlannedPath(
+            final.map((p: any) => ({ x: Number(p.x) || 0, y: Number(p.y) || 0, z: Number(p.z) || 0 }))
+          );
+        } catch (err) {
+          console.warn("[useRos] Payload paths_json tidak bisa diparse:", err);
+        }
+      }
+    );
+
+    // Daftar rintangan (pohon SDF statis + deteksi LiDAR dinamis), 2Hz.
+    // Dipakai bar ODI untuk mengenali rintangan mana yang sedang dihindari.
+    const unsubObstacles = client.subscribe(
+      "/dashboard/obstacles",
+      "std_msgs/msg/String",
+      (message: any) => {
+        try {
+          const payload = JSON.parse(message.data);
+          if (!Array.isArray(payload)) return;
+          telemetryStore.ingestObstacles(
+            payload.map((o: any) => ({
+              id: String(o.id ?? ""),
+              kind: String(o.kind ?? "obstacle"),
+              x: Number(o.x) || 0,
+              y: Number(o.y) || 0,
+              radius: Number(o.radius) || 0,
+              clearance: Number(o.clearance) || 0,
+              source: String(o.source ?? ""),
+              active: o.active !== false,
+            }))
+          );
+        } catch (err) {
+          console.warn("[useRos] Payload obstacles tidak bisa diparse:", err);
         }
       }
     );
@@ -174,6 +289,8 @@ export function useRos(wsUrl: string = DEFAULT_ROSBRIDGE_URL) {
       unsubPhase();
       unsubTelemetry();
       unsubState();
+      unsubPaths();
+      unsubObstacles();
       unsubReconnect();
       telemetryStore.dispose();
       // Client sengaja TIDAK di-dispose: ia singleton per URL dan dipakai
@@ -191,6 +308,22 @@ export function useRos(wsUrl: string = DEFAULT_ROSBRIDGE_URL) {
     pendingWaypointsRef.current = null;
     setWaypoints(pending.list.map((wp) => ({ ...wp, confirmed: true })));
   }, [vehicle.ackedSeq]);
+
+  // Penolakan (waypoints_nack) juga MENGAKHIRI penantian — ini pasangan wajib
+  // dari efek di atas. Tanpa ini, satu-satunya jalan keluar dari status
+  // "Menunggu ACK" adalah ACK yang sukses, sehingga setiap penolakan tampak
+  // seperti pesan yang hilang di jalan.
+  useEffect(() => {
+    const pending = pendingWaypointsRef.current;
+    if (!pending || vehicle.nackedSeq === 0 || vehicle.nackedSeq !== pending.seq) {
+      return;
+    }
+    pendingWaypointsRef.current = null;
+    // Marker DIPERTAHANKAN (bukan dihapus) supaya operator melihat titik mana
+    // yang ditolak dan bisa langsung memperbaikinya; alasannya dibaca dari
+    // vehicle.ackMessage.
+    setWaypoints(pending.list.map((wp) => ({ ...wp, confirmed: false, rejected: true })));
+  }, [vehicle.nackedSeq]);
 
   // ---------------------------------------------------------------------------
   // Command helpers
@@ -250,7 +383,7 @@ export function useRos(wsUrl: string = DEFAULT_ROSBRIDGE_URL) {
         orientation: { x: 0, y: 0, z: 0, w: 1 },
       },
     });
-    if (ok) setWaypoints([{ ...wp, confirmed: false }]);
+    if (ok) setWaypoints([{ ...wp, confirmed: false, rejected: false, sent: true }]);
     return ok;
   }, []);
 
@@ -261,24 +394,37 @@ export function useRos(wsUrl: string = DEFAULT_ROSBRIDGE_URL) {
    * dan status baru diperbarui setelah node membalas "waypoints_ack" dengan seq
    * yang sama (lihat efek rekonsiliasi di atas). Kalau node menolak, UI tetap
    * menampilkan status pending, bukan berbohong bahwa misi sudah terkirim.
+   *
+   * Mengembalikan SEQ pengiriman (bukan sekadar boolean) supaya pemanggil bisa
+   * mencocokkannya dengan event kedatangan "mission_complete" yang datang
+   * belakangan. Seq selalu >= 1, jadi pemakaian lama `if (ok)` tetap benar.
    */
-  const sendWaypoints = useCallback((wpList: Waypoint[]): boolean => {
+  const sendWaypoints = useCallback((wpList: Waypoint[]): number | null => {
     const client = clientRef.current;
-    if (!client || wpList.length === 0) return false;
+    if (!client || wpList.length === 0) return null;
 
     const seq = ++seqRef.current;
+    // PEMILIHAN MODE NAVIGASI.
+    // Bila autopilot punya fix GPS DAN waypoint membawa lat/lon (mis. hasil klik
+    // peta), kirim sebagai koordinat bumi — drone asli akan terbang ke titik
+    // geografis yang sesungguhnya. Bila tidak, kirim sebagai jarak lokal dalam
+    // meter, sehingga drone tanpa GPS tetap bisa dipakai tanpa perubahan alur.
+    const useGps = telemetryStore.getVehicleSnapshot().gpsValid;
+    const payload = wpList.map((wp) =>
+      useGps && typeof wp.lat === "number" && typeof wp.lon === "number"
+        ? { lat: wp.lat, lon: wp.lon, z: wp.z }
+        : { x: wp.x, y: wp.y, z: wp.z }
+    );
+
     const ok = client.publish("/dashboard/waypoints", "std_msgs/msg/String", {
-      data: JSON.stringify({
-        seq,
-        waypoints: wpList.map((wp) => ({ x: wp.x, y: wp.y, z: wp.z })),
-      }),
+      data: JSON.stringify({ seq, waypoints: payload }),
     });
 
-    if (ok) {
-      pendingWaypointsRef.current = { seq, list: wpList };
-      setWaypoints(wpList.map((wp) => ({ ...wp, confirmed: false })));
-    }
-    return ok;
+    if (!ok) return null;
+
+    pendingWaypointsRef.current = { seq, list: wpList };
+    setWaypoints(wpList.map((wp) => ({ ...wp, confirmed: false, rejected: false, sent: true })));
+    return seq;
   }, []);
 
   const clearWaypoints = useCallback(() => {
@@ -288,7 +434,16 @@ export function useRos(wsUrl: string = DEFAULT_ROSBRIDGE_URL) {
   }, []);
 
   const addWaypoint = useCallback((wp: Waypoint) => {
-    setWaypoints((prev) => [...prev, { ...wp, confirmed: false }]);
+    setWaypoints((prev) => [...prev, { ...wp, confirmed: false, rejected: false, sent: true }]);
+  }, []);
+
+  /** Taruh SATU target (marker kuning) secara lokal TANPA mengirim ke drone.
+   *  Dipakai peta Gazebo: klik memasang marker, tombol "Send Goal" yang
+   *  benar-benar mengirimnya ke planner A*. */
+  const setTargetLocal = useCallback((wp: Waypoint) => {
+    pendingWaypointsRef.current = null;
+    // sent: false -> marker tampil, TAPI garis rute belum digambar.
+    setWaypoints([{ ...wp, confirmed: false, rejected: false, sent: false }]);
   }, []);
 
   return {
@@ -310,6 +465,7 @@ export function useRos(wsUrl: string = DEFAULT_ROSBRIDGE_URL) {
     sendVelocity,
     setGoal,
     addWaypoint,
+    setTargetLocal,
     clearWaypoints,
     sendWaypoints,
   };

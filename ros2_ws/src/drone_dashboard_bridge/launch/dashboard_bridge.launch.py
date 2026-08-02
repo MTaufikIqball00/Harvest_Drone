@@ -33,7 +33,7 @@ COMMON_PARAMS = {
     "marker_frame": "map",
     "spawn_x": -65.0,
     "spawn_y": 0.0,
-    "takeoff_altitude": 8.0,
+    "takeoff_altitude": 1.0,
     "landing_altitude": 0.3,
     "manual_speed": 3.0,
     "vertical_speed": 3.0,

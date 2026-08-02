@@ -9,16 +9,8 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
-try:
-    import mysql.connector as mysql_driver
-    from mysql.connector import Error as MySqlError
-
-    MYSQL_DRIVER = "mysql_connector"
-except ModuleNotFoundError:
-    import pymysql as mysql_driver
-    from pymysql import MySQLError as MySqlError
-
-    MYSQL_DRIVER = "pymysql"
+import psycopg2
+from psycopg2 import Error as DbError
 
 import rclpy
 from nav_msgs.msg import Odometry
@@ -43,7 +35,11 @@ COMMAND_QOS = QoSProfile(
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    # Zona waktu SENGAJA dipertahankan (dulu di-strip untuk MySQL). Kolom
+    # PostgreSQL bertipe TIMESTAMPTZ: mengirim datetime naive membuat server
+    # menafsirkannya memakai zona sesi (WIB), sehingga setiap catatan bergeser
+    # 7 jam dari waktu sebenarnya.
+    return datetime.now(timezone.utc)
 
 
 def parse_json(data: str, fallback: Any) -> Any:
@@ -70,7 +66,7 @@ def heading_from_yaw(yaw: Optional[float]) -> Optional[float]:
     return (math.degrees(yaw) + 360.0) % 360.0
 
 
-class MySqlBatchWriter:
+class PostgresBatchWriter:
     def __init__(self, node: Node) -> None:
         self.node = node
         self.connection = None
@@ -83,41 +79,47 @@ class MySqlBatchWriter:
             return True
 
         try:
-            kwargs = {
-                "host": str(self.node.get_parameter("db_host").value),
-                "port": int(self.node.get_parameter("db_port").value),
-                "user": str(self.node.get_parameter("db_user").value),
-                "password": str(self.node.get_parameter("db_password").value),
-                "database": str(self.node.get_parameter("db_name").value),
-                "autocommit": False,
-            }
-            if MYSQL_DRIVER == "mysql_connector":
-                kwargs["connection_timeout"] = 3
-            else:
-                kwargs["connect_timeout"] = 3
-                kwargs["charset"] = "utf8mb4"
+            host = str(self.node.get_parameter("db_host").value)
 
-            self.connection = mysql_driver.connect(**kwargs)
-            self.node.get_logger().info(f"MySQL telemetry logger connected using {MYSQL_DRIVER}.")
+            # Supabase (PostgreSQL terkelola) MEWAJIBKAN TLS; PostgreSQL lokal
+            # umumnya tidak menyediakannya sama sekali. 'prefer' memakai TLS
+            # bila tersedia dan tetap tersambung bila tidak — jadi satu
+            # konfigurasi ini benar untuk kedua kasus.
+            sslmode = os.getenv("DRONE_DB_SSLMODE") or (
+                "prefer" if host in ("127.0.0.1", "localhost", "::1") else "require"
+            )
+
+            self.connection = psycopg2.connect(
+                host=host,
+                port=int(self.node.get_parameter("db_port").value),
+                user=str(self.node.get_parameter("db_user").value),
+                password=str(self.node.get_parameter("db_password").value),
+                dbname=str(self.node.get_parameter("db_name").value),
+                connect_timeout=3,
+                sslmode=sslmode,
+            )
+            self.connection.autocommit = False
+            self.node.get_logger().info(
+                f"PostgreSQL telemetry logger connected (sslmode={sslmode})."
+            )
             return True
-        except MySqlError as exc:
+        except DbError as exc:
             self.connection = None
-            self.node.get_logger().warning(f"MySQL connect failed: {exc}")
+            self.node.get_logger().warning(f"PostgreSQL connect failed: {exc}")
             return False
 
     def _is_connected(self) -> bool:
         if not self.connection:
             return False
-        if MYSQL_DRIVER == "mysql_connector":
-            return bool(self.connection.is_connected())
-        return bool(getattr(self.connection, "open", False))
+        # psycopg2: closed == 0 berarti masih terbuka.
+        return self.connection.closed == 0
 
     def enqueue(self, table: str, row: Dict[str, Any]) -> None:
         with self.lock:
             queue = self.queues[table]
             if len(queue) >= self.max_queue_size:
                 queue.popleft()
-                self.node.get_logger().warning(f"MySQL queue for {table} is full; dropping oldest row.")
+                self.node.get_logger().warning(f"PostgreSQL queue for {table} is full; dropping oldest row.")
             queue.append(row)
 
     def flush(self, batch_size: int) -> None:
@@ -141,12 +143,12 @@ class MySqlBatchWriter:
                 self._insert_many(cursor, table, rows)
             self.connection.commit()
             cursor.close()
-        except MySqlError as exc:
-            self.node.get_logger().error(f"MySQL flush failed: {exc}")
+        except DbError as exc:
+            self.node.get_logger().error(f"PostgreSQL flush failed: {exc}")
             try:
                 self.connection.rollback()
                 self.connection.close()
-            except MySqlError:
+            except DbError:
                 pass
             self.connection = None
 
@@ -165,19 +167,20 @@ class MySqlBatchWriter:
         if self.connection:
             try:
                 self.connection.close()
-            except MySqlError:
+            except DbError:
                 pass
 
 
-class MySqlTelemetryLogger(Node):
+class PostgresTelemetryLogger(Node):
     def __init__(self) -> None:
         super().__init__("mysql_telemetry_logger")
 
         self.declare_parameter("db_host", os.getenv("DRONE_DB_HOST", "127.0.0.1"))
-        self.declare_parameter("db_port", int(os.getenv("DRONE_DB_PORT", "3306")))
-        self.declare_parameter("db_user", os.getenv("DRONE_DB_USER", "drone_app"))
+        # 5432 = port default PostgreSQL (dulu 3306 untuk MySQL).
+        self.declare_parameter("db_port", int(os.getenv("DRONE_DB_PORT", "5432")))
+        self.declare_parameter("db_user", os.getenv("DRONE_DB_USER", "postgres"))
         self.declare_parameter("db_password", os.getenv("DRONE_DB_PASSWORD", ""))
-        self.declare_parameter("db_name", os.getenv("DRONE_DB_NAME", "drone_ops"))
+        self.declare_parameter("db_name", os.getenv("DRONE_DB_NAME", "postgres"))
         self.declare_parameter("drone_id", int(os.getenv("DRONE_DB_DRONE_ID", "1")))
         self.declare_parameter("mission_id", int(os.getenv("DRONE_DB_MISSION_ID", "0")))
         self.declare_parameter("telemetry_hz", float(os.getenv("DRONE_DB_TELEMETRY_HZ", "2.0")))
@@ -208,7 +211,7 @@ class MySqlTelemetryLogger(Node):
         self.seen_error_keys: set = set()
         self._error_key_order: Deque = deque()
 
-        self.writer = MySqlBatchWriter(self)
+        self.writer = PostgresBatchWriter(self)
 
         # /odom dipublikasikan bridge dengan BEST_EFFORT (stream sensor). Subscriber
         # RELIABLE tidak kompatibel dengan publisher BEST_EFFORT — data tidak akan
@@ -222,7 +225,7 @@ class MySqlTelemetryLogger(Node):
 
         flush_period = max(0.2, float(self.get_parameter("flush_period_sec").value))
         self.create_timer(flush_period, self.flush_tick, callback_group=self.db_cb_group)
-        self.get_logger().info("MySQL telemetry logger ready with MultiThreadedExecutor.")
+        self.get_logger().info("PostgreSQL telemetry logger ready with MultiThreadedExecutor.")
 
     def _remember(self, key: Tuple, seen: set, order: Deque) -> bool:
         """Dedup dengan jendela geser. Return False kalau key sudah pernah dilihat."""
@@ -453,7 +456,7 @@ class MySqlTelemetryLogger(Node):
         payload = parse_json(msg.data, {})
         if isinstance(payload, dict) and "mission_id" in payload:
             self.mission_id = int(payload["mission_id"])
-            self.get_logger().info(f"MySQL logger: Active mission ID updated dynamically to {self.mission_id}")
+            self.get_logger().info(f"PostgreSQL logger: Active mission ID updated dynamically to {self.mission_id}")
 
     def destroy_node(self) -> bool:
         self.writer.flush(max(1, int(self.get_parameter("batch_size").value)))
@@ -463,7 +466,7 @@ class MySqlTelemetryLogger(Node):
 
 def main(args: Optional[Iterable[str]] = None) -> None:
     rclpy.init(args=args)
-    node = MySqlTelemetryLogger()
+    node = PostgresTelemetryLogger()
     executor = MultiThreadedExecutor(num_threads=3)
     executor.add_node(node)
     try:
@@ -471,7 +474,7 @@ def main(args: Optional[Iterable[str]] = None) -> None:
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        # destroy_node() melakukan flush terakhir + menutup koneksi MySQL, jadi
+        # destroy_node() melakukan flush terakhir + menutup koneksi PostgreSQL, jadi
         # baris terakhir telemetry tidak hilang saat shutdown.
         executor.remove_node(node)
         executor.shutdown()

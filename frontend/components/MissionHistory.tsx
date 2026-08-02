@@ -100,6 +100,7 @@ export function MissionHistory() {
                 <th className="p-2">ID</th>
                 <th className="p-2">Drone</th>
                 <th className="p-2">Mode</th>
+                <th className="p-2">Jarak ke Goal (m)</th>
                 <th className="p-2">Status</th>
                 <th className="p-2">Start Time</th>
               </tr>
@@ -107,7 +108,7 @@ export function MissionHistory() {
             <tbody className="divide-y divide-slate-800">
               {data.missions.length === 0 ? (
                 <tr>
-                  <td colSpan={5} className="p-4 text-center text-slate-500">Belum ada misi tercatat di database.</td>
+                  <td colSpan={6} className="p-4 text-center text-slate-500">Belum ada misi tercatat di database.</td>
                 </tr>
               ) : (
                 data.missions.map((m) => (
@@ -115,6 +116,16 @@ export function MissionHistory() {
                     <td className="p-2 font-mono">#{m.id}</td>
                     <td className="p-2">{m.drone_name || "X500 SITL"}</td>
                     <td className="p-2 uppercase font-semibold text-cyan-300">{m.flight_mode}</td>
+                    <td className="p-2 font-mono text-amber-300">
+                      {typeof m.goal_distance_m === "number"
+                        ? `${m.goal_distance_m.toFixed(1)} m`
+                        : "—"}
+                      {m.goal_distance_source && (
+                        <span className="ml-1 text-[10px] text-slate-500 uppercase">
+                          {m.goal_distance_source}
+                        </span>
+                      )}
+                    </td>
                     <td className="p-2">
                       <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
                         {m.status}

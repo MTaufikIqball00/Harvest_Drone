@@ -20,6 +20,11 @@ ros2_ws/log/
 
 # Environment Variables & Logs
 .env
+.env.local
+.env.*.local
+# Kredensial Supabase untuk node ROS 2 (berisi password database asli).
+# Yang boleh ikut repo hanya .env.supabase.example yang nilainya placeholder.
+.env.supabase
 logs/*.log
 logs/*.pid
 

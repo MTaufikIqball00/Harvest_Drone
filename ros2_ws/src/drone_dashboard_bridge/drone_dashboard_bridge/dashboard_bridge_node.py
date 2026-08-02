@@ -24,9 +24,15 @@ from rclpy.qos import (
     QoSHistoryPolicy,
     qos_profile_sensor_data,
 )
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, NavSatFix, NavSatStatus
 from std_msgs.msg import Float32, String
 from std_srvs.srv import Trigger
+
+from drone_dashboard_bridge.geodesy import (
+    geodetic_to_local,
+    is_valid_latlon,
+    local_to_geodetic,
+)
 
 WORLD = {"x_min": -190.0, "x_max": 370.0, "y_min": -220.0, "y_max": 160.0}
 
@@ -250,6 +256,19 @@ class DashboardBridgeNode(Node):
         self._last_vel_pose: Optional[Pose2D] = None
         self._last_vel_time: Optional[float] = None
         self.velocity = {"vx": 0.0, "vy": 0.0, "vz": 0.0, "speed": 0.0}
+
+        # --- Referensi GPS ---
+        # Berbeda dari PX4, MAVROS tidak menyediakan ref_lat/ref_lon frame lokal.
+        # Referensi dibentuk sendiri dengan memasangkan fix GPS pertama dengan
+        # posisi lokal pada saat yang sama (lihat gps_cb). Bila drone tidak
+        # punya GPS, gps_valid tetap False dan sistem bekerja dalam meter saja.
+        self.gps_valid = False
+        self.ref_lat: Optional[float] = None
+        self.ref_lon: Optional[float] = None
+        self.ref_alt: Optional[float] = None
+        self._gps_last_fix_time = 0.0
+        # Timeout: kalau fix berhenti mengalir, GPS dianggap hilang.
+        self._gps_timeout_sec = 3.0
         # FIX BUG #3: Lock untuk melindungi pasangan (path, path_index) dari
         # race condition antara thread ThreadPoolExecutor (done_cb planner)
         # dan thread MultiThreadedExecutor (control_tick 20Hz).
@@ -306,6 +325,7 @@ class DashboardBridgeNode(Node):
         self.create_subscription(PoseStamped, "/mavros/local_position/pose", self.local_pose_cb, SENSOR_QOS, callback_group=self.control_cb_group)
         self.create_subscription(BatteryState, "/mavros/battery", self.battery_cb, SENSOR_QOS, callback_group=self.sensor_cb_group)
         self.create_subscription(State, "/mavros/state", self.vehicle_state_cb, SENSOR_QOS, callback_group=self.sensor_cb_group)
+        self.create_subscription(NavSatFix, "/mavros/global_position/global", self.gps_cb, SENSOR_QOS, callback_group=self.sensor_cb_group)
 
         # --- Outputs ---
         self.odom_pub = self.create_publisher(Odometry, "/odom", SENSOR_QOS)
@@ -1145,18 +1165,30 @@ class DashboardBridgeNode(Node):
             return
 
         parsed: List[Pose2D] = []
+        sources = set()
         for item in raw:
-            try:
-                x = float(item["x"])
-                y = float(item["y"])
-                z = float(item.get("z", self.takeoff_altitude))
-            except (KeyError, TypeError, ValueError):
-                self.publish_ack("waypoints_nack", seq, 0, "Format waypoint salah (butuh x, y).")
+            if not isinstance(item, dict):
+                self.publish_ack("waypoints_nack", seq, 0, "Entri waypoint harus berupa objek.")
                 return
+
+            x, y, src = self.resolve_waypoint(item)
+            if x is None:
+                self.publish_ack("waypoints_nack", seq, 0, src)
+                return
+            sources.add(src)
+
+            try:
+                z = float(item.get("z", self.takeoff_altitude))
+            except (TypeError, ValueError):
+                self.publish_ack("waypoints_nack", seq, 0, "Altitude waypoint tidak valid.")
+                return
+
             if not (WORLD["x_min"] <= x <= WORLD["x_max"] and WORLD["y_min"] <= y <= WORLD["y_max"]):
                 self.publish_ack("waypoints_nack", seq, 0, f"Waypoint ({x:.1f}, {y:.1f}) di luar batas world.")
                 return
             parsed.append(Pose2D(x=x, y=y, z=z, yaw=self.current_pose.yaw))
+
+        mode_txt = "GPS (lat/lon)" if "gps" in sources else "jarak lokal (meter)"
 
         with self._path_lock:
             self.path = parsed
@@ -1175,7 +1207,91 @@ class DashboardBridgeNode(Node):
         self.rtl_triggered = False
         self._path_dirty = True
         self.publish_path()
-        self.publish_ack("waypoints_ack", seq, len(parsed), f"{len(parsed)} waypoint diterima & misi dimulai.")
+        self.publish_ack(
+            "waypoints_ack", seq, len(parsed),
+            f"{len(parsed)} waypoint diterima via {mode_txt} & misi dimulai.",
+        )
+
+    # ------------------------------------------------------------------
+    # JEMBATAN GPS <-> FRAME LOKAL (varian MAVROS/ArduPilot)
+    # ------------------------------------------------------------------
+    def gps_cb(self, msg: NavSatFix) -> None:
+        """Fix GPS dari MAVROS.
+
+        MAVROS tidak mengekspos origin frame lokal (tidak ada padanan
+        ref_lat/ref_lon milik PX4). Karena itu referensi dibentuk sendiri:
+        saat fix PERTAMA yang valid tiba, pasangkan lat/lon tersebut dengan
+        posisi lokal drone SAAT ITU. Dari situ seluruh konversi berikutnya
+        konsisten.
+
+        Kalau drone tidak punya GPS, callback ini tidak pernah menerima fix
+        valid sehingga gps_valid tetap False dan sistem otomatis memakai
+        navigasi berbasis jarak.
+        """
+        if msg.status.status < NavSatStatus.STATUS_FIX:
+            return
+        if not is_valid_latlon(msg.latitude, msg.longitude):
+            return
+        if self.current_pose is None:
+            return
+
+        self._gps_last_fix_time = time.monotonic()
+
+        if not self.gps_valid:
+            # Ikat referensi: lat/lon ini berpadanan dengan posisi lokal saat ini.
+            east = self.current_pose.x - self.spawn_x
+            north = self.current_pose.y - self.spawn_y
+            self.ref_lat, self.ref_lon = local_to_geodetic(
+                -east, -north, float(msg.latitude), float(msg.longitude)
+            )
+            self.ref_alt = float(msg.altitude) if math.isfinite(msg.altitude) else None
+            self.gps_valid = True
+            self.get_logger().info(
+                f"GPS aktif (fix={msg.status.status}). Origin lokal = "
+                f"({self.ref_lat:.7f}, {self.ref_lon:.7f}). Waypoint lat/lon didukung."
+            )
+
+    def pose_to_latlon(self, pose: Pose2D) -> Tuple[Optional[float], Optional[float]]:
+        """Posisi lokal -> lat/lon. None bila tidak ada referensi GPS."""
+        if not self.gps_valid or self.ref_lat is None:
+            return None, None
+        east = pose.x - self.spawn_x
+        north = pose.y - self.spawn_y
+        return local_to_geodetic(east, north, self.ref_lat, self.ref_lon)
+
+    def latlon_to_pose_xy(self, lat: float, lon: float) -> Tuple[float, float]:
+        """lat/lon -> (x, y) frame lokal Pose2D (sudah termasuk offset spawn)."""
+        east, north = geodetic_to_local(lat, lon, self.ref_lat, self.ref_lon)
+        return east + self.spawn_x, north + self.spawn_y
+
+    def resolve_waypoint(self, item: dict) -> Tuple[Optional[float], Optional[float], str]:
+        """Tentukan (x, y) target dari satu entri waypoint.
+
+        Menerima dua bentuk dan memilih otomatis:
+          - {"lat": .., "lon": ..}  -> dipakai bila GPS aktif
+          - {"x": .., "y": ..}      -> jarak lokal dalam meter
+        """
+        has_geo = is_valid_latlon(item.get("lat"), item.get("lon"))
+        has_xy = isinstance(item.get("x"), (int, float)) and isinstance(item.get("y"), (int, float))
+
+        if has_geo:
+            if not self.gps_valid:
+                return None, None, "Waypoint memakai lat/lon tetapi GPS belum fix."
+            x, y = self.latlon_to_pose_xy(float(item["lat"]), float(item["lon"]))
+            return x, y, "gps"
+        if has_xy:
+            return float(item["x"]), float(item["y"]), "local"
+        return None, None, "Waypoint tidak punya (lat,lon) maupun (x,y)."
+
+    def check_gps_timeout(self) -> None:
+        """Tandai GPS hilang bila fix berhenti mengalir."""
+        if not self.gps_valid:
+            return
+        if time.monotonic() - self._gps_last_fix_time > self._gps_timeout_sec:
+            self.gps_valid = False
+            self.get_logger().warning(
+                "GPS hilang (tidak ada fix). Kembali ke navigasi berbasis jarak (meter)."
+            )
 
     def takeoff_altitude_cb(self, msg: Float32) -> None:
         """Altitude takeoff dari dashboard. Di-clamp supaya input UI yang salah
@@ -2107,7 +2223,17 @@ class DashboardBridgeNode(Node):
             "nearestObstacle": self.nearest_obstacle_m,
             "pathIndex": self.path_index,
             "pathLength": len(self.path),
+            # Koordinat bumi sesungguhnya bila GPS aktif. Saat gpsValid=False
+            # keduanya dihilangkan dan dashboard kembali memakai proyeksi dari
+            # posisi lokal, sehingga drone tanpa GPS tetap tergambar di peta.
+            "gpsValid": self.gps_valid,
         }
+
+        lat, lon = self.pose_to_latlon(pose)
+        if lat is not None:
+            payload["lat"] = round(lat, 7)
+            payload["lon"] = round(lon, 7)
+
         self.telemetry_pub.publish(String(data=json.dumps(payload)))
 
     def snapshot_payload(self) -> Dict[str, object]:
@@ -2136,6 +2262,9 @@ class DashboardBridgeNode(Node):
             "wind": self.wind,
             "nearestObstacle": self.nearest_obstacle_m,
             "rtlTriggered": self.rtl_triggered,
+            "gpsValid": self.gps_valid,
+            "refLat": self.ref_lat,
+            "refLon": self.ref_lon,
             "waypointSeq": self._waypoint_seq,
             "waypointCount": len(self.path),
             "planner": {
@@ -2159,6 +2288,9 @@ class DashboardBridgeNode(Node):
         # Path hanya dipublikasikan ulang saat benar-benar berubah (dirty flag).
         # Versi lama menserialisasi 6 daftar waypoint jadi JSON tiap 500ms —
         # untuk rute boustrophedon ratusan titik itu CPU & bandwidth terbuang.
+        # GPS bisa hilang di tengah misi (kehilangan satelit / antena). Cek di
+        # sini supaya status yang dilaporkan ke dashboard selalu mutakhir.
+        self.check_gps_timeout()
         self.publish_path()
         self.state_pub.publish(String(data=json.dumps(self.snapshot_payload())))
         self.obstacles_pub.publish(String(data=json.dumps(self.obstacles)))

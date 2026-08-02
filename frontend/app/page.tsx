@@ -16,18 +16,21 @@
  * aktif dan hasil klasifikasi terakhir.
  */
 
-import React, { useCallback, useMemo, useState } from "react";
-import { useRos } from "@/lib/useRos";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { useRos, useVehicleState } from "@/lib/useRos";
 import type { Waypoint } from "@/lib/telemetryStore";
+import { completeMissionGoal, recordMissionGoal } from "@/lib/missionLog";
 import type { ClassificationResult } from "@/lib/api";
 import { TelemetryPanel } from "@/components/TelemetryPanel";
 import { DroneController } from "@/components/DroneController";
 import { InteractiveMap } from "@/components/InteractiveMap";
 import { GazeboMapView } from "@/components/GazeboMapView";
+import { ObstacleAvoidanceBar } from "@/components/ObstacleAvoidanceBar";
 import { HarvestUploader } from "@/components/HarvestUploader";
 import { ClassificationResults } from "@/components/ClassificationResults";
 import { MissionHistory } from "@/components/MissionHistory";
 import { SystemStatus } from "@/components/SystemStatus";
+import { SessionBadge } from "@/components/SessionBadge";
 import {
   LayoutDashboard,
   MapPin,
@@ -48,6 +51,53 @@ const TABS: { id: TabId; label: string; Icon: typeof LayoutDashboard }[] = [
   { id: "history", label: "Mission Logs & MySQL", Icon: Database },
   { id: "system", label: "Dual Bridge Health", Icon: Activity },
 ];
+
+/**
+ * Bungkus peta simulasi Gazebo dalam komponen kecil terisolasi — sama seperti
+ * pola CoordinateBadge/GpsBadge di komponen lain — supaya subscribe ke
+ * useVehicleState() tidak membuat Home ikut render setiap kali field lain
+ * yang lebih sering berubah (mis. latencyMs) diperbarui.
+ *
+ * Disembunyikan total (bukan dinonaktifkan) saat advancedFeaturesSupported
+ * false: peta ini menggambar world simulasi Gazebo yang tidak relevan sama
+ * sekali untuk drone DJI Spark asli (RosBridgeClient.java melaporkan flag ini
+ * false).
+ */
+const GazeboMapSection = React.memo(function GazeboMapSection({
+  waypoints,
+  connected,
+  onSetTargetWaypoint,
+  onSendGoal,
+  onClearWaypoints,
+}: {
+  waypoints: Waypoint[];
+  connected: boolean;
+  onSetTargetWaypoint: (wp: Waypoint | null) => void;
+  onSendGoal: (wp: Waypoint) => void;
+  onClearWaypoints: () => void;
+}) {
+  const { advancedFeaturesSupported } = useVehicleState();
+  if (!advancedFeaturesSupported) return null;
+
+  return (
+    <div>
+      <h2 className="text-xs font-bold text-slate-300 uppercase tracking-wider mb-2 flex items-center gap-2">
+        <Cpu className="w-4 h-4 text-emerald-400" /> 1. Peta Simulasi Gazebo
+      </h2>
+      <GazeboMapView
+        waypoints={waypoints}
+        connected={connected}
+        onSetTargetWaypoint={onSetTargetWaypoint}
+        onSendGoal={onSendGoal}
+        onClearWaypoints={onClearWaypoints}
+      />
+      {/* Bar penghindaran rintangan (ODI) — menyala realtime saat detour aktif. */}
+      <div className="mt-3">
+        <ObstacleAvoidanceBar />
+      </div>
+    </div>
+  );
+});
 
 const PHASE_LABEL: Record<string, string> = {
   idle: "ROSBRIDGE IDLE",
@@ -71,8 +121,11 @@ export default function Home() {
     forceArmTakeoff,
     startAutoSurvey,
     sendVelocity,
+    setGoal,
+    setTargetLocal,
     clearWaypoints,
     sendWaypoints,
+    vehicle,
   } = useRos();
 
   const [activeTab, setActiveTab] = useState<TabId>("overview");
@@ -82,13 +135,57 @@ export default function Home() {
 
   // Handler di-memo supaya identitasnya stabil — kalau tidak, React.memo pada
   // peta & panel kontrol tidak ada gunanya (prop baru tiap render).
-  const handleSetTarget = useCallback(
+  //
+  // KEDUA peta memakai pola yang sama: klik hanya MEMASANG marker kuning,
+  // lalu tombol "Send Goal" yang benar-benar mengirim. Tanpa jeda ini, satu
+  // salah klik langsung menerbangkan drone sekaligus mencatat misi palsu.
+  const handlePlaceTarget = useCallback(
     (wp: Waypoint | null) => {
-      if (wp) sendWaypoints([wp]);
+      if (wp) setTargetLocal(wp);
       else clearWaypoints();
     },
-    [sendWaypoints, clearWaypoints]
+    [setTargetLocal, clearWaypoints]
   );
+
+  // Peta Gazebo: kirim ke planner A* lewat /dashboard/goal_pose (x/y/z lokal).
+  const handleSendGoal = useCallback(
+    (wp: Waypoint) => {
+      const ok = setGoal(wp);
+      if (ok) recordMissionGoal(wp);
+      return ok;
+    },
+    [setGoal]
+  );
+
+  // Peta Leaflet: SENGAJA lewat sendWaypoints(), bukan setGoal().
+  // sendWaypoints mengirim lat/lon asli saat GPS fix (plus protokol ACK),
+  // sedangkan setGoal hanya membawa x/y/z lokal — memakainya di sini akan
+  // diam-diam membuang koordinat bumi yang justru jadi inti peta ini.
+  // Pencatatan jaraknya tetap identik dengan peta Gazebo.
+  const handleSendMapGoal = useCallback(
+    (wp: Waypoint) => {
+      // seq dipakai untuk mencocokkan misi ini dengan event kedatangan
+      // ("mission_complete") yang datang belakangan dari drone.
+      const seq = sendWaypoints([wp]);
+      if (seq) recordMissionGoal(wp, seq);
+      return seq;
+    },
+    [sendWaypoints]
+  );
+
+  /**
+   * Tutup baris misi di database begitu drone melaporkan tiba di waypoint.
+   *
+   * Sumber kebenarannya adalah event "mission_complete" dari jembatan drone,
+   * BUKAN perhitungan jarak di dashboard: hanya jembatan yang tahu radius
+   * terima yang sebenarnya dipakai loop kontrolnya.
+   *
+   * Efek ini hanya jalan saat completedSeq BERUBAH, jadi satu kedatangan =
+   * satu penutupan (endpoint PATCH juga menolak menutup baris dua kali).
+   */
+  useEffect(() => {
+    if (vehicle.completedSeq > 0) completeMissionGoal(vehicle.completedSeq);
+  }, [vehicle.completedSeq]);
 
   const handleClassificationDone = useCallback(
     (res: ClassificationResult) => setClassificationResult(res),
@@ -149,6 +246,8 @@ export default function Home() {
             />
             <span className="font-semibold text-slate-300">{statusLabel}</span>
           </div>
+
+          <SessionBadge />
         </div>
       </header>
 
@@ -177,17 +276,13 @@ export default function Home() {
           {activeTab === "overview" && (
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
               <div className="lg:col-span-2 flex flex-col gap-6">
-                <div>
-                  <h2 className="text-xs font-bold text-slate-300 uppercase tracking-wider mb-2 flex items-center gap-2">
-                    <Cpu className="w-4 h-4 text-emerald-400" /> 1. Peta Simulasi Gazebo
-                  </h2>
-                  <GazeboMapView
-                    waypoints={waypoints}
-                    connected={connected}
-                    onSetTargetWaypoint={handleSetTarget}
-                    onClearWaypoints={clearWaypoints}
-                  />
-                </div>
+                <GazeboMapSection
+                  waypoints={waypoints}
+                  connected={connected}
+                  onSetTargetWaypoint={handlePlaceTarget}
+                  onSendGoal={handleSendGoal}
+                  onClearWaypoints={clearWaypoints}
+                />
 
                 <div>
                   <h2 className="text-xs font-bold text-slate-300 uppercase tracking-wider mb-2 flex items-center gap-2">
@@ -195,8 +290,10 @@ export default function Home() {
                   </h2>
                   <InteractiveMap
                     waypoints={waypoints}
+                    connected={connected}
                     classificationUrl={visualizationUrl}
-                    onSetTargetWaypoint={handleSetTarget}
+                    onSetTargetWaypoint={handlePlaceTarget}
+                    onSendGoal={handleSendMapGoal}
                     onClearWaypoints={clearWaypoints}
                   />
                 </div>
