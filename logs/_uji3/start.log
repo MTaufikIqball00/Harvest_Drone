@@ -1,0 +1,106 @@
+=== Cleaning up previous background processes ===
+=== Stopping Drone-Stack Monorepo Services ===
+=== All services stopped cleanly ===
+=== Starting PostgreSQL Service ===
+=== Starting FastAPI AI Backend Service (Port 8000) ===
+=== Starting ROS 2 Environment & Bridges ===
+Dashboard bridge menggunakan flight stack: dji
+Mode DJI: tidak menjalankan MAVROS/XRCE-Agent/dashboard_bridge_node.
+Sambungkan app di HP Android ke IP laptop ini, port 9090 (rosbridge).
+=== Starting PostgreSQL Telemetry/Obstacle Logger ===
+=== Starting Next.js Frontend Dashboard (Port 3000) ===
+=========================================================
+  DRONE-STACK MONOREPO SERVICES STARTED SUCCESSFULLY!  
+  Dashboard Next.js  : http://localhost:3000            
+  FastAPI AI Backend : http://localhost:8000/docs       
+  ROSBridge WS       : ws://localhost:9090              
+  -----------------------------------------------------
+  Mode DJI: di app Android, masukkan IP laptop ini
+  sebagai 'Laptop Bridge' -> 172.24.180.182:9090
+=========================================================
+Press Ctrl+C to stop services. Streaming live logs below:
+---------------------------------------------------------
+==> /home/iqball/drone-stack/logs/fastapi.log <==
+
+==> /home/iqball/drone-stack/logs/frontend.log <==
+
+==> /home/iqball/drone-stack/logs/fastapi.log <==
+INFO:     Started server process [21942]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+
+==> /home/iqball/drone-stack/logs/frontend.log <==
+
+> drone-stack-frontend@1.0.0 dev
+> next dev -p 3000
+
+ ⚠ Warning: Next.js inferred your workspace root, but it may not be correct.
+ We detected multiple lockfiles and selected the directory of /home/iqball/drone-stack/package-lock.json as the root directory.
+ To silence this warning, set `outputFileTracingRoot` in your Next.js config, or consider removing one of the lockfiles if it's not needed.
+   See https://nextjs.org/docs/app/api-reference/config/next-config-js/output#caveats for more information.
+ Detected additional lockfiles: 
+   * /home/iqball/drone-stack/frontend/package-lock.json
+
+   ▲ Next.js 15.5.21
+   - Local:        http://localhost:3000
+   - Network:      http://10.255.255.254:3000
+   - Environments: .env.local
+
+ ✓ Starting...
+ ✓ Ready in 2.7s
+ ✓ Compiled /middleware in 410ms (116 modules)
+ ○ Compiling /login ...
+ ✓ Compiled /login in 3.3s (571 modules)
+ GET /login 200 in 4012ms
+ ✓ Compiled in 995ms (247 modules)
+ GET /login 200 in 190ms
+ ⚠ Cross origin request detected from 127.0.0.1 to /_next/* resource. In a future major version of Next.js, you will need to explicitly configure "allowedDevOrigins" in next.config to allow this.
+Read more: https://nextjs.org/docs/app/api-reference/config/next-config-js/allowedDevOrigins
+ ○ Compiling /api/auth/login ...
+ ✓ Compiled /api/auth/login in 974ms (579 modules)
+ POST /api/auth/login 200 in 1994ms
+ ○ Compiling / ...
+ ✓ Compiled / in 1684ms (1039 modules)
+ GET / 200 in 2008ms
+ GET / 200 in 58ms
+ ○ Compiling /api/auth/me ...
+ ✓ Compiled /api/auth/me in 1021ms (1046 modules)
+ GET /api/auth/me 200 in 1273ms
+ ○ Compiling /api/missions ...
+ ✓ Compiled /api/missions in 549ms (1048 modules)
+ POST /api/missions 200 in 1610ms
+ POST /api/missions 200 in 120ms
+ POST /api/missions 200 in 882ms
+ POST /api/missions 200 in 886ms
+ POST /api/missions 200 in 802ms
+ POST /api/missions 200 in 664ms
+ POST /api/missions 200 in 846ms
+ POST /api/missions 200 in 785ms
+ POST /api/missions 200 in 788ms
+ POST /api/missions 200 in 880ms
+ GET /login 200 in 330ms
+ POST /api/auth/login 200 in 651ms
+ GET / 200 in 66ms
+ GET / 200 in 61ms
+ GET /api/auth/me 200 in 37ms
+ POST /api/missions 200 in 566ms
+ PATCH /api/missions 200 in 97ms
+ POST /api/missions 200 in 113ms
+ PATCH /api/missions 200 in 98ms
+ POST /api/missions 200 in 110ms
+ PATCH /api/missions 200 in 97ms
+ POST /api/missions 200 in 109ms
+ PATCH /api/missions 200 in 99ms
+ POST /api/missions 200 in 112ms
+ PATCH /api/missions 200 in 99ms
+ POST /api/missions 200 in 110ms
+ PATCH /api/missions 200 in 849ms
+ POST /api/missions 200 in 109ms
+ PATCH /api/missions 200 in 1051ms
+ POST /api/missions 200 in 107ms
+ PATCH /api/missions 200 in 832ms
+ POST /api/missions 200 in 110ms
+ PATCH /api/missions 200 in 813ms
+ POST /api/missions 200 in 112ms
+ PATCH /api/missions 200 in 791ms

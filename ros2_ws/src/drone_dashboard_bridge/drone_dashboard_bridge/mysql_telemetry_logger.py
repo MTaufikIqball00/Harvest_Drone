@@ -202,6 +202,12 @@ class PostgresTelemetryLogger(Node):
         self.last_telemetry_insert = 0.0
         self.last_state_insert = 0.0
         self.latest_state: Dict[str, Any] = {}
+        # Payload /dashboard/telemetry terakhir. Dipakai dua hal: mengisi
+        # latitude/longitude pada baris dari /odom (Odometry hanya membawa
+        # posisi lokal), dan menjadi SUMBER telemetry_logs saat /odom memang
+        # tidak ada (mode DJI).
+        self.latest_telemetry: Dict[str, Any] = {}
+        self.last_odom_monotonic = 0.0
         # Dedup key disimpan dalam deque terbatas + set pendamping. Versi lama
         # memakai set murni yang tumbuh selamanya: misi panjang dengan ribuan
         # deteksi LiDAR membuat RAM node naik terus (memory leak).
@@ -218,6 +224,14 @@ class PostgresTelemetryLogger(Node):
         # pernah sampai. Karena itu telemetry pakai SENSOR_QOS, sedangkan topik
         # state/command tetap RELIABLE supaya event tidak ada yang hilang.
         self.create_subscription(Odometry, "/odom", self.odom_cb, SENSOR_QOS, callback_group=self.fast_cb_group)
+        # /dashboard/telemetry — sumber telemetry KEDUA, wajib untuk drone asli.
+        # Pada mode DJI tidak ada node Python yang mempublikasikan /odom (app
+        # Android yang berperan sebagai jembatan), sehingga tanpa langganan ini
+        # tabel telemetry_logs tidak pernah terisi sama sekali. Topik ini
+        # dipublikasikan BEST_EFFORT; subscriber BEST_EFFORT tetap cocok dengan
+        # publisher RELIABLE milik rosbridge, jadi satu profil ini benar untuk
+        # kedua sumber.
+        self.create_subscription(String, "/dashboard/telemetry", self.telemetry_cb, SENSOR_QOS, callback_group=self.fast_cb_group)
         self.create_subscription(String, "/dashboard/state", self.state_cb, COMMAND_QOS, callback_group=self.fast_cb_group)
         self.create_subscription(String, "/dashboard/obstacles", self.obstacles_cb, COMMAND_QOS, callback_group=self.fast_cb_group)
         self.create_subscription(String, "/dashboard/metrics", self.metrics_cb, COMMAND_QOS, callback_group=self.fast_cb_group)
@@ -239,6 +253,11 @@ class PostgresTelemetryLogger(Node):
 
     def odom_cb(self, msg: Odometry) -> None:
         now = time.monotonic()
+        # Dicatat SEBELUM penyaring laju: penanda ini menyatakan "/odom hidup",
+        # bukan "/odom baru saja ditulis". Kalau ditaruh setelah `return` di
+        # bawah, telemetry_cb akan mengira /odom mati di sela-sela throttle dan
+        # ikut menulis baris kedua untuk momen yang sama.
+        self.last_odom_monotonic = now
         if now - self.last_telemetry_insert < self.telemetry_period:
             return
         self.last_telemetry_insert = now
@@ -261,8 +280,11 @@ class PostgresTelemetryLogger(Node):
                 "x": finite_or_none(pose.position.x),
                 "y": finite_or_none(pose.position.y),
                 "z": finite_or_none(pose.position.z),
-                "latitude": None,
-                "longitude": None,
+                # Odometry hanya membawa posisi LOKAL. Koordinat bumi diambil
+                # dari /dashboard/telemetry supaya kedua kolom ini tidak lagi
+                # selamanya NULL seperti sebelumnya.
+                "latitude": finite_or_none(self.latest_telemetry.get("lat")),
+                "longitude": finite_or_none(self.latest_telemetry.get("lon")),
                 "altitude_m": finite_or_none(pose.position.z),
                 "velocity_x": vx,
                 "velocity_y": vy,
@@ -276,6 +298,68 @@ class PostgresTelemetryLogger(Node):
                 "nav_state": vehicle.get("navStateName"),
                 "source": "ros2",
                 "raw_payload": None,
+            },
+        )
+
+    # Selang toleransi sebelum /odom dianggap mati. Cukup longgar untuk menahan
+    # satu-dua pesan yang hilang (topiknya BEST_EFFORT), cukup ketat supaya
+    # peralihan ke sumber cadangan terasa segera saat jembatan memang berganti.
+    ODOM_STALE_SEC = 3.0
+
+    def telemetry_cb(self, msg: String) -> None:
+        """Sumber telemetry cadangan + pemasok lat/lon untuk jalur /odom.
+
+        Menulis telemetry_logs HANYA bila /odom sedang tidak mengalir, sehingga
+        pada mode simulasi (yang punya keduanya) tidak ada baris ganda.
+        """
+        payload = parse_json(msg.data, {})
+        if not isinstance(payload, dict):
+            return
+        self.latest_telemetry = payload
+
+        now = time.monotonic()
+        if now - self.last_odom_monotonic < self.ODOM_STALE_SEC:
+            return  # /odom yang berwenang; di sini cukup jadi pemasok lat/lon.
+        if now - self.last_telemetry_insert < self.telemetry_period:
+            return
+        self.last_telemetry_insert = now
+
+        vehicle = self.latest_state.get("vehicle") or {}
+        yaw = finite_or_none(payload.get("yaw"))
+        heading = finite_or_none(payload.get("heading"))
+        if heading is None and yaw is not None:
+            heading = heading_from_yaw(yaw)
+
+        self.writer.enqueue(
+            "telemetry_logs",
+            {
+                "drone_id": self.drone_id,
+                "mission_id": self.mission_id,
+                "recorded_at": utc_now(),
+                "x": finite_or_none(payload.get("x")),
+                "y": finite_or_none(payload.get("y")),
+                "z": finite_or_none(payload.get("z")),
+                "latitude": finite_or_none(payload.get("lat")),
+                "longitude": finite_or_none(payload.get("lon")),
+                # Drone asli melaporkan ketinggian relatif lewat `alt`; `z`
+                # dipakai sebagai cadangan untuk jembatan yang tidak mengirimnya.
+                "altitude_m": finite_or_none(payload.get("alt"))
+                if payload.get("alt") is not None
+                else finite_or_none(payload.get("z")),
+                "velocity_x": finite_or_none(payload.get("vx")),
+                "velocity_y": finite_or_none(payload.get("vy")),
+                "velocity_z": finite_or_none(payload.get("vz")),
+                "speed_mps": finite_or_none(payload.get("speed")),
+                "yaw_rad": yaw,
+                "pitch_rad": finite_or_none(payload.get("pitch")),
+                "roll_rad": finite_or_none(payload.get("roll")),
+                "heading_deg": heading,
+                "flight_mode": payload.get("flightMode") or self.latest_state.get("mode"),
+                "nav_state": payload.get("navState") or vehicle.get("navStateName"),
+                # Dibedakan dari "ros2" supaya saat analisis jelas baris ini
+                # berasal dari jembatan drone asli, bukan dari Odometry simulasi.
+                "source": "dashboard_telemetry",
+                "raw_payload": json.dumps(payload),
             },
         )
 
@@ -454,9 +538,21 @@ class PostgresTelemetryLogger(Node):
 
     def active_mission_cb(self, msg: String) -> None:
         payload = parse_json(msg.data, {})
-        if isinstance(payload, dict) and "mission_id" in payload:
-            self.mission_id = int(payload["mission_id"])
-            self.get_logger().info(f"PostgreSQL logger: Active mission ID updated dynamically to {self.mission_id}")
+        if not isinstance(payload, dict) or "mission_id" not in payload:
+            return
+        try:
+            raw = int(payload["mission_id"])
+        except (TypeError, ValueError):
+            return
+
+        # 0 (atau negatif) berarti "tidak ada misi aktif" dan HARUS jadi None.
+        # Menyimpannya apa adanya membuat setiap INSERT ditolak: mission_id
+        # punya foreign key ke missions(id), dan baris dengan id 0 tidak ada —
+        # satu misi yang selesai akan mematikan seluruh pencatatan berikutnya.
+        self.mission_id = raw if raw > 0 else None
+        self.get_logger().info(
+            f"PostgreSQL logger: mission_id aktif -> {self.mission_id}"
+        )
 
     def destroy_node(self) -> bool:
         self.writer.flush(max(1, int(self.get_parameter("batch_size").value)))

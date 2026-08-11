@@ -19,6 +19,35 @@
 
 import { telemetryStore, type Waypoint } from "./telemetryStore";
 import { distanceToTarget } from "./geo";
+import { getRosClient, DEFAULT_ROSBRIDGE_URL } from "./rosClient";
+
+/**
+ * Beri tahu node ROS misi mana yang sedang aktif.
+ *
+ * Node logger (mysql_telemetry_logger) berlangganan topik ini dan memakai
+ * nilainya untuk mengisi kolom `mission_id` pada telemetry_logs, battery_logs,
+ * wind_logs, obstacle_logs, dan error_logs. Tanpa publikasi ini seluruh baris
+ * log tersimpan dengan mission_id NULL — datanya ada, tapi tidak bisa
+ * dihubungkan ke misi mana pun, sehingga tidak bisa dianalisis per penerbangan.
+ *
+ * `getRosClient` adalah singleton per-URL yang sama dengan yang dipakai
+ * useRos(), jadi ini memakai koneksi WebSocket yang sudah ada — bukan membuka
+ * koneksi baru.
+ *
+ * Fire-and-forget seperti sisa modul ini: gagal memberi tahu node tidak boleh
+ * mengganggu penerbangan yang sedang berjalan.
+ */
+function publishActiveMission(missionId: number): void {
+  try {
+    getRosClient(DEFAULT_ROSBRIDGE_URL).publish(
+      "/dashboard/active_mission",
+      "std_msgs/msg/String",
+      { data: JSON.stringify({ mission_id: missionId }) }
+    );
+  } catch (err) {
+    console.error("[missions] Gagal mengumumkan misi aktif ke ROS:", err);
+  }
+}
 
 /**
  * Peta seq pengiriman -> id baris `missions` di database.
@@ -51,17 +80,27 @@ export function recordMissionGoal(
   flightMode: string = "auto"
 ): void {
   const live = telemetryStore.live;
+  // Titik awal & jarak rencana diambil dari posisi yang sudah dihaluskan.
+  // Satu sampel GPS mentah bisa meleset beberapa meter dari posisi sebenarnya,
+  // dan angka itu tersimpan PERMANEN sebagai goal_distance_m — pembanding
+  // utama untuk jarak tempuh nanti.
+  const pos = telemetryStore.getRenderPosition();
   const { horizontalM, source } = distanceToTarget(
-    { x: live.x, y: live.y, z: live.z, lat: live.lat, lon: live.lon, gpsValid: live.gpsValid },
+    { x: pos.x, y: pos.y, z: live.z, lat: pos.lat, lon: pos.lon, gpsValid: live.gpsValid },
     { x: wp.x, y: wp.y, z: wp.z, lat: wp.lat, lon: wp.lon }
   );
+
+  // Odometer dinolkan TEPAT saat perintah dikirim, sebelum drone bergerak,
+  // supaya jarak tempuh yang dicatat nanti murni milik misi ini — bukan
+  // akumulasi sisa misi sebelumnya.
+  telemetryStore.resetOdometer();
 
   fetch("/api/missions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      startX: live.x,
-      startY: live.y,
+      startX: pos.x,
+      startY: pos.y,
       destX: wp.x,
       destY: wp.y,
       goalDistanceM: Number(horizontalM.toFixed(3)),
@@ -74,6 +113,11 @@ export function recordMissionGoal(
       if (!data?.success) {
         console.error("[missions] Gagal menyimpan jarak goal:", data?.error);
         return;
+      }
+      if (typeof data.missionId === "number") {
+        // Umumkan SEGERA setelah id database diketahui: baris log yang terbit
+        // sejak detik ini sudah membawa mission_id yang benar.
+        publishActiveMission(data.missionId);
       }
       if (typeof seq === "number" && typeof data.missionId === "number") {
         if (seqToMissionId.size >= MAX_PENDING) {
@@ -104,10 +148,20 @@ export function completeMissionGoal(seq: number): void {
   }
   seqToMissionId.delete(seq);
 
+  // Jarak yang BENAR-BENAR ditempuh, dibaca sebelum odometer dipakai misi
+  // berikutnya. Inilah pasangan pembanding goal_distance_m (jarak rencana
+  // garis lurus): selisih keduanya adalah deviasi lintasan akibat menghindari
+  // rintangan dan koreksi navigasi.
+  const finalDistanceM = Number(telemetryStore.getOdometerM().toFixed(3));
+
+  // mission_id 0 = "tidak ada misi aktif". Node menerjemahkannya jadi NULL,
+  // sehingga log setelah misi selesai tidak salah dikaitkan ke misi ini.
+  publishActiveMission(0);
+
   fetch("/api/missions", {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ missionId }),
+    body: JSON.stringify({ missionId, finalDistanceM }),
   })
     .then((res) => res.json())
     .then((data) => {

@@ -306,7 +306,15 @@ export function useRos(wsUrl: string = DEFAULT_ROSBRIDGE_URL) {
     if (!pending || vehicle.ackedSeq !== pending.seq) return;
     // Node mengonfirmasi seq ini — baru sekarang UI menandai waypoint valid.
     pendingWaypointsRef.current = null;
-    setWaypoints(pending.list.map((wp) => ({ ...wp, confirmed: true })));
+    // `sent` dan `rejected` WAJIB ditulis ulang di sini. pending.list adalah
+    // daftar MENTAH yang dioper ke sendWaypoints() dan belum punya kedua flag
+    // itu — flag-nya baru ditambahkan pada setWaypoints() saat pengiriman.
+    // Tanpa baris ini, `sent` kembali undefined begitu ACK tiba, dan garis rute
+    // (yang syaratnya `targetWp?.sent`) LENYAP justru pada detik drone mulai
+    // bergerak — persis saat operator paling butuh melihatnya.
+    setWaypoints(
+      pending.list.map((wp) => ({ ...wp, confirmed: true, rejected: false, sent: true }))
+    );
   }, [vehicle.ackedSeq]);
 
   // Penolakan (waypoints_nack) juga MENGAKHIRI penantian — ini pasangan wajib

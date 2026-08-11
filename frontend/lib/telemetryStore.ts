@@ -28,6 +28,10 @@
  * dibutuhkannya (selective selector) tanpa memasang Zustand/Redux.
  */
 
+// geo.ts sengaja tidak mengimpor apa pun, jadi arah impor ini satu arah dan
+// tidak menimbulkan siklus dengan store.
+import { haversineMeters } from "@/lib/geo";
+
 export interface TelemetryData {
   x: number;
   y: number;
@@ -142,6 +146,16 @@ export interface Waypoint {
 export interface TrailPoint {
   x: number;
   y: number;
+  /**
+   * Koordinat GPS asli saat titik ini direkam, bila autopilot punya fix.
+   *
+   * Wajib disimpan terpisah dari x/y: pada drone asli (mis. DJI) jembatan
+   * mengirim lat/lon sebagai sumber kebenaran, sementara x/y bisa tetap 0.
+   * Menggambar jejak dari x/y saja membuat seluruh trail menumpuk di titik
+   * origin sementara ikon drone terbang menjauh — jejaknya tampak "hilang".
+   */
+  lat?: number;
+  lon?: number;
 }
 
 /** Satu titik pada rute misi terencana (mis. jalur boustrophedon auto survey). */
@@ -172,6 +186,52 @@ const UI_INTERVAL_MS = 1000 / UI_HZ;
 
 /** Batas titik trail yang disimpan. Ring buffer, bukan array yang tumbuh terus. */
 const TRAIL_CAPACITY = 600;
+
+/**
+ * Di bawah ambang ini wahana dianggap DIAM (hover), jadi tidak ada jarak yang
+ * bertambah. Estimator kecepatan pun menyisakan sedikit riak saat hover;
+ * tanpa ambang ini riak itu menumpuk sepanjang misi.
+ */
+const ODOMETER_MIN_SPEED_MPS = 0.15;
+
+/**
+ * Batas atas kecepatan yang dipercaya (m/s). Nilai di atas ini hampir pasti
+ * sampel telemetry rusak, bukan wahana yang benar-benar melesat.
+ */
+const ODOMETER_MAX_SPEED_MPS = 30;
+
+/**
+ * Jeda antar-sampel terpanjang yang masih diintegrasikan. Lebih lama dari ini
+ * berarti telemetry sempat putus — kecepatan terakhir tidak boleh dianggap
+ * berlaku selama seluruh keheningan itu.
+ */
+const ODOMETER_MAX_GAP_SEC = 2;
+
+/**
+ * Penghalusan posisi tampilan (exponential moving average).
+ *
+ * GPS tidak pernah benar-benar diam: fix-nya terus berayun beberapa meter
+ * walau wahana hover sempurna. Digambar mentah pada 15 fps, ayunan itu tampak
+ * sebagai ikon yang bergetar terus-menerus dan jejak yang berkelok padahal
+ * lintasan aslinya lurus.
+ *
+ * Kekuatan penghalusan MENGIKUTI KECEPATAN, bukan tetap. Saat diam, seluruh
+ * perubahan posisi hampir pasti derau, jadi dihaluskan berat. Saat melaju,
+ * perubahan itu gerakan nyata, jadi hampir tidak dihaluskan — supaya ikon tidak
+ * tertinggal di belakang posisi drone yang sebenarnya.
+ */
+const SMOOTH_ALPHA_DIAM = 0.08;
+const SMOOTH_ALPHA_LAJU = 0.5;
+const SMOOTH_SPEED_FULL_MPS = 1.0;
+
+/**
+ * Lompatan di atas ini diikuti seketika, tanpa dihaluskan. Perpindahan sebesar
+ * ini bukan derau melainkan peristiwa diskret — GPS baru mendapat fix, atau
+ * origin koordinat lokal digeser. Menghaluskannya akan membuat ikon merayap
+ * pelan melintasi peta selama beberapa detik.
+ */
+const SMOOTH_SNAP_M = 20;
+
 /** Jarak minimum antar titik trail (meter) — hindari ribuan titik menumpuk saat hover. */
 const TRAIL_MIN_DISTANCE_M = 0.4;
 
@@ -239,6 +299,25 @@ class TelemetryStore {
   private trailSnapshot: TrailPoint[] = [];
   private trailDirty = false;
   private lastTrailPoint: TrailPoint | null = null;
+
+  /**
+   * Odometer: panjang lintasan yang BENAR-BENAR ditempuh sejak reset terakhir.
+   *
+   * Sengaja dihitung terpisah dari `trail`, bukan dengan menjumlahkan ruas-ruas
+   * trail: trail memakai penyaring 0,4 m dan ring buffer 600 titik, jadi ia
+   * membuang detail lintasan dan MELUPAKAN awal misi yang panjang — dua hal
+   * yang membuatnya salah dipakai sebagai alat ukur jarak.
+   */
+  private odometerM = 0;
+  /** Cap waktu sampel terakhir — dasar perhitungan dt untuk integral v × dt. */
+  private lastOdometerAt: number | null = null;
+
+  /**
+   * Posisi hasil penghalusan — INILAH yang dipakai untuk menggambar dan
+   * mengukur. `live.x/y/lat/lon` sengaja dibiarkan mentah supaya panel telemetry
+   * tetap menampilkan angka apa adanya dari wahana.
+   */
+  private smoothed: { x: number; y: number; lat: number; lon: number } | null = null;
 
   /** Rute misi terencana (mis. jalur boustrophedon), diterima lewat
    *  /dashboard/paths_json. Frekuensi rendah — hanya berubah saat misi baru
@@ -316,7 +395,10 @@ class TelemetryStore {
       vehicleChanged = true;
     }
 
-    this.appendTrail(live.x, live.y);
+    // Urutannya penting: haluskan dulu, baru ukur & gambar dari hasilnya.
+    this.updateSmoothedPosition();
+    this.accumulateOdometer();
+    this.appendTrail();
 
     // Slice frekuensi rendah hanya diberi tahu saat benar-benar berubah.
     if (vehicleChanged) {
@@ -412,14 +494,130 @@ class TelemetryStore {
   // ---------------------------------------------------------------------------
   // TRAIL
   // ---------------------------------------------------------------------------
-  private appendTrail(x: number, y: number): void {
+  // ---------------------------------------------------------------------------
+  // PENGHALUSAN POSISI
+  // ---------------------------------------------------------------------------
+  /** Kecepatan horizontal terbaik yang tersedia (m/s). */
+  private currentSpeedMps(): number {
+    const live = this.live;
+    if (Number.isFinite(live.speed) && live.speed > 0) return Math.abs(live.speed);
+    return Math.hypot(live.vx || 0, live.vy || 0);
+  }
+
+  private updateSmoothedPosition(): void {
+    const live = this.live;
+    const hasGps = live.gpsValid && !!live.lat && !!live.lon;
+
+    if (!this.smoothed) {
+      this.smoothed = { x: live.x, y: live.y, lat: live.lat, lon: live.lon };
+      return;
+    }
+
+    const prev = this.smoothed;
+    const jump = hasGps
+      ? haversineMeters(prev.lat, prev.lon, live.lat, live.lon)
+      : Math.hypot(live.x - prev.x, live.y - prev.y);
+
+    if (jump > SMOOTH_SNAP_M) {
+      this.smoothed = { x: live.x, y: live.y, lat: live.lat, lon: live.lon };
+      return;
+    }
+
+    const speed = this.currentSpeedMps();
+    const t = Math.min(1, speed / SMOOTH_SPEED_FULL_MPS);
+    const alpha = SMOOTH_ALPHA_DIAM + (SMOOTH_ALPHA_LAJU - SMOOTH_ALPHA_DIAM) * t;
+
+    prev.x += (live.x - prev.x) * alpha;
+    prev.y += (live.y - prev.y) * alpha;
+    if (hasGps) {
+      prev.lat += (live.lat - prev.lat) * alpha;
+      prev.lon += (live.lon - prev.lon) * alpha;
+    }
+  }
+
+  /**
+   * Posisi untuk digambar & diukur. Selalu tersedia: sebelum sampel pertama
+   * tiba, nilainya jatuh ke posisi mentah sehingga pemanggil tidak perlu
+   * menangani kasus null.
+   */
+  getRenderPosition = (): { x: number; y: number; lat: number; lon: number } => {
+    const live = this.live;
+    return this.smoothed ?? { x: live.x, y: live.y, lat: live.lat, lon: live.lon };
+  };
+
+  // ---------------------------------------------------------------------------
+  // ODOMETER (jarak tempuh aktual)
+  // ---------------------------------------------------------------------------
+  /**
+   * Tambahkan jarak tempuh dengan MENGINTEGRASIKAN KECEPATAN (v × dt).
+   *
+   * Bukan dengan menjumlahkan selisih posisi antar-sampel. Pendekatan selisih
+   * posisi terlihat masuk akal tetapi SELALU melebih-lebihkan panjang lintasan
+   * pada data ber-derau: setiap sampel menyumbang |gerak nyata + derau|, dan
+   * karena nilai mutlak, komponen deraunya tidak pernah saling meniadakan —
+   * ia bertambah secara kuadratur. Diukur dengan derau GPS 1,2 m, cara itu
+   * mencatat 181,77 m untuk lintasan yang sebenarnya 40,85 m. Menghaluskan
+   * posisi lebih dulu hanya mengurangi, tidak menghapus, bias tersebut.
+   *
+   * Kecepatan berasal dari fusi IMU di wahana — jauh lebih tenang daripada
+   * posisi GPS — sehingga integralnya tidak punya bias searah. Ketiga jembatan
+   * (PX4, MAVROS, DJI) sama-sama mengirim field `speed`.
+   */
+  private accumulateOdometer(): void {
+    const now = Date.now();
+    const last = this.lastOdometerAt;
+    this.lastOdometerAt = now;
+
+    if (last === null) return;
+
+    const dt = (now - last) / 1000;
+    // Jeda panjang = telemetry sempat putus. Mengalikan kecepatan terakhir
+    // dengan jeda itu sama saja mengarang jarak untuk waktu yang tidak terpantau.
+    if (dt <= 0 || dt > ODOMETER_MAX_GAP_SEC) return;
+
+    const speed = this.currentSpeedMps();
+    if (speed < ODOMETER_MIN_SPEED_MPS || speed > ODOMETER_MAX_SPEED_MPS) return;
+
+    this.odometerM += speed * dt;
+  }
+
+  /** Nolkan odometer — dipanggil saat misi baru dimulai. */
+  resetOdometer(): void {
+    this.odometerM = 0;
+    this.lastOdometerAt = null;
+  }
+
+  /** Jarak tempuh (meter) sejak reset terakhir. */
+  getOdometerM = (): number => this.odometerM;
+
+  private appendTrail(): void {
+    const live = this.live;
+    // Jejak digambar dari posisi yang SUDAH dihaluskan. Dari posisi mentah,
+    // ayunan GPS antar-sampel kerap melampaui TRAIL_MIN_DISTANCE_M sehingga
+    // lolos sebagai "gerakan", dan lintasan lurus tergambar berkelok-kelok.
+    const pos = this.getRenderPosition();
+    const { x, y } = pos;
+    const hasGps = live.gpsValid && !!pos.lat && !!pos.lon;
+
     const last = this.lastTrailPoint;
     if (last) {
-      const dx = x - last.x;
-      const dy = y - last.y;
-      if (dx * dx + dy * dy < TRAIL_MIN_DISTANCE_M * TRAIL_MIN_DISTANCE_M) return;
+      // Saat GPS aktif, jarak diukur dari lat/lon — bukan dari x/y yang bisa
+      // diam di 0 pada drone asli. Tanpa ini penyaring jarak menganggap drone
+      // tidak pernah bergerak, sehingga hanya SATU titik jejak yang tersimpan.
+      if (hasGps && typeof last.lat === "number" && typeof last.lon === "number") {
+        if (haversineMeters(last.lat, last.lon, pos.lat, pos.lon) < TRAIL_MIN_DISTANCE_M) {
+          return;
+        }
+      } else {
+        const dx = x - last.x;
+        const dy = y - last.y;
+        if (dx * dx + dy * dy < TRAIL_MIN_DISTANCE_M * TRAIL_MIN_DISTANCE_M) return;
+      }
     }
-    const point = { x, y };
+
+    const point: TrailPoint = hasGps
+      ? { x, y, lat: pos.lat, lon: pos.lon }
+      : { x, y };
     this.trail.push(point);
     if (this.trail.length > TRAIL_CAPACITY) this.trail.shift();
     this.lastTrailPoint = point;

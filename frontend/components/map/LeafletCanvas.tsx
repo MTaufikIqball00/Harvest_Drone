@@ -96,11 +96,14 @@ function LiveDroneLayer({ followDrone }: { followDrone: boolean }) {
       lastRender = timestamp;
 
       const live = telemetryStore.live;
+      // Posisi yang SUDAH dihaluskan. Dari lat/lon mentah, ayunan GPS beberapa
+      // meter membuat ikon bergetar terus-menerus walau drone hover diam.
+      const pos = telemetryStore.getRenderPosition();
       // Pakai lat/lon ASLI dari GPS bila tersedia; kalau tidak, proyeksikan
       // dari posisi lokal supaya drone tanpa GPS tetap tergambar.
-      const [lat, lon] = live.gpsValid && live.lat && live.lon
-        ? [live.lat, live.lon]
-        : metersToLatLon(live.x, live.y);
+      const [lat, lon] = live.gpsValid && pos.lat && pos.lon
+        ? [pos.lat, pos.lon]
+        : metersToLatLon(pos.x, pos.y);
 
       const key = `${lat.toFixed(7)}|${lon.toFixed(7)}|${live.heading.toFixed(1)}`;
       if (key !== lastKey) {
@@ -113,7 +116,17 @@ function LiveDroneLayer({ followDrone }: { followDrone: boolean }) {
       const points = telemetryStore.getLiveTrail();
       if (points.length !== lastTrailLength) {
         lastTrailLength = points.length;
-        trail.setLatLngs(points.map((p) => metersToLatLon(p.x, p.y)));
+        // Titik yang direkam saat GPS aktif membawa lat/lon aslinya; pakai itu
+        // langsung. Memproyeksikan x/y untuk titik semacam itu menaruh jejak di
+        // origin, jauh dari ikon dronenya — inilah sebab jejak tampak hilang
+        // pada drone asli. Titik tanpa GPS tetap diproyeksikan seperti semula.
+        trail.setLatLngs(
+          points.map((p) =>
+            typeof p.lat === "number" && typeof p.lon === "number"
+              ? ([p.lat, p.lon] as [number, number])
+              : metersToLatLon(p.x, p.y)
+          )
+        );
       }
     };
 
@@ -170,10 +183,13 @@ function RouteLine({ target }: { target: Waypoint }) {
       const live = telemetryStore.live;
       const wp = targetRef.current;
 
+      // Pangkal garis mengikuti posisi halus yang sama dengan ikon drone —
+      // kalau memakai posisi mentah, garis akan bergetar lepas dari ikonnya.
+      const pos = telemetryStore.getRenderPosition();
       const [dLat, dLon] =
-        live.gpsValid && live.lat && live.lon
-          ? [live.lat, live.lon]
-          : metersToLatLon(live.x, live.y);
+        live.gpsValid && pos.lat && pos.lon
+          ? [pos.lat, pos.lon]
+          : metersToLatLon(pos.x, pos.y);
       const [tLat, tLon] =
         typeof wp.lat === "number" && typeof wp.lon === "number"
           ? [wp.lat, wp.lon]
@@ -230,8 +246,11 @@ function LiveDistanceLabel({
 
       const live = telemetryStore.live;
       const wp = targetRef.current;
+      // Posisi halus juga di sini: dari posisi mentah, angka jarak berkedip
+      // naik-turun beberapa meter walau drone diam.
+      const pos = telemetryStore.getRenderPosition();
       const { horizontalM } = distanceToTarget(
-        { x: live.x, y: live.y, z: live.z, lat: live.lat, lon: live.lon, gpsValid: live.gpsValid },
+        { x: pos.x, y: pos.y, z: live.z, lat: pos.lat, lon: pos.lon, gpsValid: live.gpsValid },
         { x: wp.x, y: wp.y, z: wp.z, lat: wp.lat, lon: wp.lon }
       );
       const text = formatDistance(horizontalM);

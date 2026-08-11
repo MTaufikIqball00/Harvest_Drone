@@ -139,28 +139,32 @@ else
     nohup ros2 launch drone_dashboard_bridge dashboard_bridge.launch.py \
         flight_stack:="$FLIGHT_STACK" > "$ROOT_DIR/logs/dashboard_bridge.log" 2>&1 &
 
-    # MySQL Telemetry & Obstacle Logger.
-    #
-    # BUG (sudah ada sebelumnya): node ini TIDAK PERNAH dijalankan oleh script
-    # mana pun, padahal ia satu-satunya penulis telemetry_logs, obstacle_logs,
-    # battery_logs, wind_logs, dan error_logs dari topik /dashboard/* ke MySQL.
-    # Akibatnya seluruh data ROS — termasuk deteksi rintangan saat misi — tidak
-    # pernah masuk DB. (Riwayat misi tetap terlihat karena ditulis frontend lewat
-    # /api/missions, jalur yang berbeda.)
-    #
-    # Kredensial DB dioper EKSPLISIT dari .env (DB_*). Node membaca env dengan
-    # nama DRONE_DB_* sehingga tanpa override ini ia memakai password kosong dan
-    # gagal konek.
-    echo "=== Starting PostgreSQL Telemetry/Obstacle Logger ==="
-    nohup ros2 run drone_dashboard_bridge mysql_telemetry_logger --ros-args \
-        -p db_host:="${DB_HOST:-127.0.0.1}" \
-        -p db_port:="${DB_PORT:-5432}" \
-        -p db_user:="${DB_USER:-postgres}" \
-        -p db_password:="${DB_PASSWORD:-}" \
-        -p db_name:="${DB_NAME:-postgres}" \
-        -p drone_id:="${DRONE_DB_DRONE_ID:-1}" \
-        > "$ROOT_DIR/logs/mysql_logger.log" 2>&1 &
 fi
+
+# PostgreSQL Telemetry & Obstacle Logger.
+#
+# Node ini satu-satunya penulis telemetry_logs, obstacle_logs, battery_logs,
+# wind_logs, dan error_logs. (missions ditulis frontend lewat /api/missions,
+# jalur yang berbeda.)
+#
+# SENGAJA DI LUAR percabangan flight stack di atas. Sebelumnya blok ini berada
+# di dalam cabang `else`, sehingga pada mode --dji logger TIDAK PERNAH jalan dan
+# seluruh tabel log tetap kosong walau drone terbang normal. Sumber datanya
+# adalah topik /dashboard/* yang pada mode DJI dipublikasikan oleh app Android —
+# jadi tidak ada alasan logger hanya hidup di mode simulasi.
+#
+# Kredensial DB dioper EKSPLISIT dari .env (DB_*). Node membaca env dengan
+# nama DRONE_DB_* sehingga tanpa override ini ia memakai password kosong dan
+# gagal konek.
+echo "=== Starting PostgreSQL Telemetry/Obstacle Logger ==="
+nohup ros2 run drone_dashboard_bridge mysql_telemetry_logger --ros-args \
+    -p db_host:="${DB_HOST:-127.0.0.1}" \
+    -p db_port:="${DB_PORT:-5432}" \
+    -p db_user:="${DB_USER:-postgres}" \
+    -p db_password:="${DB_PASSWORD:-}" \
+    -p db_name:="${DB_NAME:-postgres}" \
+    -p drone_id:="${DRONE_DB_DRONE_ID:-1}" \
+    > "$ROOT_DIR/logs/mysql_logger.log" 2>&1 &
 
 # ROSBridge Server — dibutuhkan SEMUA mode (termasuk DJI, sebagai satu-satunya
 # titik sambung app Android).
