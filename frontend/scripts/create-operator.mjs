@@ -38,17 +38,25 @@ const here = dirname(fileURLToPath(import.meta.url));
  * supaya `DB_HOST=... npm run create-operator` tetap bisa dipakai.
  */
 function loadEnvLocal() {
-  try {
-    const raw = readFileSync(resolve(here, "..", ".env.local"), "utf8");
-    for (const line of raw.split("\n")) {
-      const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/i);
-      if (!match) continue;
-      const [, key, rawValue] = match;
-      if (process.env[key] !== undefined) continue;
-      process.env[key] = rawValue.replace(/^["']|["']$/g, "");
+  const candidatePaths = [
+    resolve(here, "..", ".env.local"),
+    resolve(here, "..", ".env"),
+    resolve(here, "..", "..", ".env"),
+  ];
+
+  for (const envPath of candidatePaths) {
+    try {
+      const raw = readFileSync(envPath, "utf8");
+      for (const line of raw.split("\n")) {
+        const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/i);
+        if (!match) continue;
+        const [, key, rawValue] = match;
+        if (process.env[key] !== undefined) continue;
+        process.env[key] = rawValue.replace(/^["']|["']$/g, "");
+      }
+    } catch {
+      // Lewati bila file tidak ditemukan
     }
-  } catch {
-    // Tidak ada .env.local: pakai environment apa adanya.
   }
 }
 

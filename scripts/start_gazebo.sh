@@ -4,7 +4,13 @@
 # =============================================================================
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PX4_DIR="${PX4_DIR:-/home/iqball/drone-stack/external/PX4-Autopilot}"
+if [ -z "$PX4_DIR" ]; then
+    if [ -d "$ROOT_DIR/external/PX4-Autopilot" ]; then
+        PX4_DIR="$ROOT_DIR/external/PX4-Autopilot"
+    else
+        PX4_DIR="/home/iqball/drone-stack/external/PX4-Autopilot"
+    fi
+fi
 ROS_WS="$ROOT_DIR/ros2_ws"
 
 echo "=== Cleaning up previous PX4 / Gazebo instances ==="

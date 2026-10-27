@@ -1,213 +1,231 @@
-# Dokumentasi Sistem Drone Autonomous
-**Platform: ROS 2 Jazzy | PX4 Autopilot | Gazebo Harmonic | Next.js | MySQL**
+# Dokumentasi Sistem Drone Autonomous & AI Harvest Classification
+**Platform: ROS 2 Jazzy | PX4 Autopilot / ArduPilot / DJI Spark | Gazebo Harmonic | Next.js 15 | FastAPI AI | PostgreSQL (Supabase)**
 
 ## 1. Arsitektur Teknologi
-Sistem ini dirancang untuk melakukan navigasi drone secara otonom dengan monitoring real-time.
-- **Frontend:** Next.js (Dashboard & Visualisasi Map)
-- **Communication:** WebSockets (Real-time Data) & REST API
-- **Middleware:** ROS 2 Jazzy (DDS Communication)
-- **Flight Controller:** PX4 Autopilot
-- **Simulator:** Gazebo Harmonic (Physics Engine)
-- **Database:** MySQL (dengan phpMyAdmin sebagai manajemen UI)
+Sistem ini dirancang untuk monitoring pertanian presisi, navigasi drone otonom, dan analisis kesiapan panen padi secara real-time.
+- **Frontend Dashboard:** Next.js 15 (React 19, Leaflet/Protomaps offline basemap, ROSLib WebSocket client)
+- **AI Processing Backend:** FastAPI (OpenCV, Rasterio, CLAHE & HSV Segmentation, NodeODM Photogrammetry)
+- **Middleware & Robotics:** ROS 2 Jazzy (rclpy, uXRCE-DDS Agent untuk PX4, MAVROS untuk ArduPilot, rosbridge WebSocket suite)
+- **Flight Controller & Simulator:** PX4 Autopilot v1.14+, ArduPilot SITL, DJI Spark (Android Mobile SDK), Gazebo Harmonic
+- **Database:** PostgreSQL / Supabase (menggunakan pg pool di Next.js dan psycopg2 batch writer di ROS 2)
 
 ---
 
 ## 2. Entity Relationship Diagram (ERD)
-Diagram di bawah ini menjelaskan struktur data dan hubungan antar entitas dalam database MySQL.
+Diagram di bawah menjelaskan struktur data relasional PostgreSQL (`database/supabase_schema.sql`):
 
 ```mermaid
 erDiagram
-    USERS ||--o{ FLIGHT_MISSIONS : "performs"
-    DRONES ||--o{ TELEMETRY_LOGS : "generates"
+    USERS ||--o{ MISSIONS : "operates"
+    DRONES ||--o{ MISSIONS : "assigned"
+    DRONES ||--o{ TELEMETRY_LOGS : "logs"
     DRONES ||--o{ BATTERY_LOGS : "monitors"
-    DRONES ||--o{ REALTIME_TRACKING : "updates"
     DRONES ||--o{ OBSTACLE_LOGS : "detects"
     DRONES ||--o{ WIND_LOGS : "records"
-    FLIGHT_MISSIONS ||--o{ AUTONOMOUS_RESULTS : "produces"
-    FLIGHT_MISSIONS ||--o{ ERROR_LOGS : "triggers"
-    DRONES ||--o{ FLIGHT_MISSIONS : "assigned to"
+    DRONES ||--o{ ERROR_LOGS : "reports"
+    MISSIONS ||--o{ TELEMETRY_LOGS : "tracks"
+    MISSIONS ||--o{ BATTERY_LOGS : "records"
+    MISSIONS ||--o{ OBSTACLE_LOGS : "encounters"
+    MISSIONS ||--o{ ERROR_LOGS : "triggers"
+    MISSIONS ||--o{ HARVEST_JOBS : "links"
+    HARVEST_JOBS ||--o{ HARVEST_CLASSIFICATIONS : "produces"
 
     USERS {
         int id PK
         string username
-        string email
-        string password
-        string role
+        string password_hash
+        user_role role
+        timestamptz created_at
     }
 
     DRONES {
         int id PK
-        string drone_name
-        string model_type
-        string status
+        string name
+        string model
+        drone_status status
+        timestamptz created_at
+    }
+
+    MISSIONS {
+        int id PK
+        int drone_id FK
+        int operator_id FK
+        timestamptz start_time
+        timestamptz end_time
+        timestamptz arrival_time
+        float start_x
+        float start_y
+        float dest_x
+        float dest_y
+        float goal_distance_m
+        string goal_distance_source
+        string flight_mode
+        mission_status status
+        int total_duration_sec
     }
 
     TELEMETRY_LOGS {
-        int id PK
+        bigint id PK
+        int mission_id FK
         int drone_id FK
+        timestamptz recorded_at
+        float x
+        float y
+        float z
         float latitude
         float longitude
-        float altitude
-        float velocity
-        timestamp created_at
+        float altitude_m
+        float speed_mps
+        float heading_deg
+        string flight_mode
     }
 
     BATTERY_LOGS {
-        int id PK
+        bigint id PK
+        int mission_id FK
         int drone_id FK
-        float voltage
-        float percentage
-        float current
-        timestamp created_at
-    }
-
-    FLIGHT_MISSIONS {
-        int id PK
-        int user_id FK
-        int drone_id FK
-        string mission_name
-        string mission_status
-        timestamp start_time
-        timestamp end_time
+        timestamptz recorded_at
+        float battery_percent
+        float voltage_v
+        float current_a
+        float estimated_remaining_sec
     }
 
     OBSTACLE_LOGS {
-        int id PK
+        bigint id PK
+        int mission_id FK
         int drone_id FK
-        float distance
-        string sensor_position
-        timestamp created_at
+        string obstacle_uid
+        timestamptz detected_at
+        float x
+        float y
+        float radius_m
+        string obstacle_type
+        string source
+        string avoidance_action
     }
 
     WIND_LOGS {
-        int id PK
-        int drone_id FK
-        float speed
-        string direction
-        timestamp created_at
-    }
-
-    AUTONOMOUS_RESULTS {
-        int id PK
+        bigint id PK
         int mission_id FK
-        text summary
-        float accuracy_rate
-        string flight_path_json
+        int drone_id FK
+        timestamptz recorded_at
+        float wind_speed_mps
+        float wind_direction_deg
+        string safety_status
     }
 
     ERROR_LOGS {
-        int id PK
+        bigint id PK
         int mission_id FK
-        string error_code
-        text description
-        timestamp created_at
+        int drone_id FK
+        timestamptz occurred_at
+        string severity
+        string subsystem
+        string message
     }
 
-    REALTIME_TRACKING {
-        int id PK
-        int drone_id FK
-        float lat
-        float lng
-        float heading
+    HARVEST_JOBS {
+        string id PK
+        int mission_id FK
+        string job_name
+        job_status status
+        float progress_percent
+        float total_area_m2
+        float estimated_yield_tons
+        timestamptz created_at
+    }
+
+    HARVEST_CLASSIFICATIONS {
+        bigint id PK
+        string job_id FK
+        string class_name
+        bigint pixel_count
+        float area_m2
+        float percentage
+        string color_hex
     }
 ```
 
 ---
 
-## 3. Skema Relasi Database
-| Tabel | Relasi | Deskripsi |
-| :--- | :--- | :--- |
-| **Users -> Flight Missions** | `One-to-Many` | Satu user dapat mengelola banyak misi penerbangan. |
-| **Drones -> Telemetry/Battery** | `One-to-Many` | Satu drone menghasilkan log telemetri dan baterai secara kontinu. |
-| **Drones -> Realtime Tracking** | `One-to-One/Many` | Data posisi terkini drone untuk sinkronisasi dashboard UI. |
-| **Flight Missions -> Results** | `One-to-One` | Setiap misi yang selesai akan menghasilkan satu ringkasan hasil otonom. |
-| **Drones -> Obstacle/Wind Logs** | `One-to-Many` | Drone mencatat gangguan eksternal (angin/rintangan) selama penerbangan. |
-
----
-
-## 4. Data Flow Diagram (DFD)
+## 3. Data Flow Diagram (DFD)
 
 ### DFD Level 0 (Context Diagram)
-Menggambarkan interaksi sistem utama dengan entitas eksternal (User dan Environment Simulator).
-
 ```mermaid
 graph LR
-    User((User/Operator)) -- "Command/Mission" --> System[System Drone Autonomous]
-    System -- "Real-time Data/Alerts" --> User
+    Operator((Operator / Pilot)) -- "Waypoint & Command" --> System[Drone Stack Platform]
+    System -- "Real-time Telemetry & Panen AI" --> Operator
     
-    Gazebo((Gazebo/PX4 Environment)) -- "Sensor Data/Physics" --> System
-    System -- "Actuator Control/PWM" --> Gazebo
+    Drone((Drone / PX4 / Gazebo)) -- "Sensor Data & Odometry" --> System
+    System -- "Offboard Setpoint / MAVLink" --> Drone
     
-    DB[(MySQL Database)] <--> System
+    PostgreSQL[(PostgreSQL / Supabase)] <--> System
+    NodeODM[(NodeODM Photogrammetry)] <--> System
 ```
 
-### DFD Level 1 (Process Detail)
-Penjelasan detail proses internal sistem.
-
+### DFD Level 1 (Proses Internal)
 ```mermaid
 graph TD
     subgraph Frontend_NextJS
-        P1[UI Dashboard & Mission Planner]
-        P2[WebSocket Client Visualizer]
+        P1[Dashboard & Mission Planner]
+        P2[ROSLib WebSocket Client]
+        P3[AI Analysis Viewer]
     end
 
     subgraph ROS2_Middleware
-        P3[Autonomous Navigation Engine]
-        P4[Obstacle Avoidance System]
-        P5[Telemetry & Status Logger]
-        P6[RTH - Return To Home Manager]
+        P4[Dashboard Bridge Node]
+        P5[A-Star & Boustrophedon Planner]
+        P6[Postgres Telemetry Logger]
+        P7[rosbridge_server WebSocket :9090]
     end
 
-    subgraph Hardware_Simulation
-        P7[PX4 Autopilot & Gazebo]
+    subgraph Backend_AI_FastAPI
+        P8[FastAPI Server :8000]
+        P9[Stitching & Classification Engine]
     end
 
-    subgraph Data_Storage
-        P8[(MySQL & phpMyAdmin)]
+    subgraph External_Systems
+        P10[PX4 SITL / ArduPilot / DJI Spark]
+        P11[Gazebo Harmonic Simulator]
+        P12[NodeODM Service :3001]
+        P13[(PostgreSQL / Supabase)]
     end
 
     %% Flow UI to ROS2
-    User --> P1
-    P1 -- "Mission Protocol" --> P3
+    P1 -- "Waypoint / Command" --> P2
+    P2 -- "WS JSON" --> P7
+    P7 <--> P4
+    P4 <--> P5
+    P4 -- "uORB / MAVLink" --> P10
+    P11 -- "LiDAR & Clock" --> P4
     
-    %% Flow ROS2 to PX4
-    P3 -- "Offboard Command" --> P7
-    P4 -- "Safety Stop/Bypass" --> P7
-    P7 -- "Sensor/Lidar Data" --> P4
-    P7 -- "Global Position" --> P5
-    
-    %% Flow Logging
-    P5 -- "Insert Telemetry/Battery" --> P8
-    P4 -- "Insert Obstacle Log" --> P8
-    P7 -- "Failsafe Trigger" --> P6
-    
-    %% Flow Realtime Visualization
-    P5 -- "Broadcast WebSocket" --> P2
-    P2 -- "Render Map/Charts" --> User
-    
-    %% Feedback Loop
-    P6 -- "Command Land/RTL" --> P7
+    %% Telemetry logging
+    P4 -- "/dashboard/* topics" --> P6
+    P6 -- "Batch INSERT" --> P13
+
+    %% AI Pipeline
+    P1 -- "Upload Raw Photos" --> P8
+    P8 <--> P12
+    P8 --> P9
+    P9 -- "Save Results & Overlay" --> P3
+    P1 -- "API /missions" --> P13
 ```
 
 ---
 
-## 5. Penjelasan Proses Utama
+## 4. Penjelasan Komponen Utama
 
-1.  **Autonomous Navigation:** Proses ini menerima *waypoints* dari Next.js melalui ROS 2 Service/Action. Navigation Engine menghitung lintasan dan mengirimkan perintah `setpoint_raw` ke PX4.
-2.  **Obstacle Avoidance:** Menggunakan data sensor (LiDAR/Depth Camera) dari Gazebo Harmonic. Jika rintangan terdeteksi, sistem interupsi pada DFD Level 1 akan mengalihkan jalur atau menghentikan drone.
-3.  **Telemetry Logging:** ROS 2 *subscriber* menangkap data dari topic `/fmu/out/vehicle_global_position` dan menyimpannya ke MySQL melalui backend API secara periodik.
-4.  **Battery Monitoring & RTH:** Sistem secara konstan memonitor tegangan baterai. Jika di bawah ambang batas (misal 20%), proses *Return To Home* (P6) akan mengambil alih kendali PX4 untuk mendaratkan drone di *home position*.
-5.  **WebSocket Communication:** Digunakan untuk mem-bypass latensi database saat visualisasi. Data koordinat langsung dikirim dari ROS 2 ke UI Next.js untuk pergerakan marker map yang mulus.
-6.  **Wind Logging:** Mencatat simulasi gaya eksternal dari Gazebo untuk menganalisis stabilitas algoritma PID/EKF pada drone.
-
----
-
-## 6. Cara Menggunakan
-1.  **Diagram:** Pastikan file ini disimpan dengan ekstensi `.md`. Jika dibuka di GitHub atau VS Code (dengan ekstensi Mermaid), diagram akan otomatis muncul.
-2.  **Database:** Gunakan skema ERD untuk membuat tabel di **phpMyAdmin**.
-3.  **Integrasi:** Pastikan `rosbridge_suite` terpasang jika ingin menghubungkan Next.js langsung ke ROS 2 melalui WebSockets.
-
----
-
-### Catatan Profesional
-Dokumentasi ini dirancang agar memenuhi standar teknis laporan skripsi atau dokumentasi teknis perusahaan. Penggunaan **Mermaid.js** memastikan bahwa dokumentasi Anda bersifat *version-control friendly* karena berbasis teks, bukan gambar statis.
+1. **Dashboard Bridge (`drone_dashboard_bridge`):**
+   - Mendukung multi flight stack: PX4 SITL (uXRCE-DDS), ArduPilot (MAVROS), dan DJI Spark (Android App Bridge).
+   - Menangani kalkulasi geodesi (WGS84 lat/lon ke ENU lokal meter), deteksi rintangan LiDAR 2D, serta replanning jalur A* secara dinamis.
+2. **Postgres Telemetry Logger (`mysql_telemetry_logger.py`):**
+   - Merekam telemetri, baterai, estimasi angin, dan rintangan ke database PostgreSQL/Supabase secara asinkron dengan antrean *batch writer* (`executemany`) berkinerja tinggi.
+3. **Backend AI (`backend_ai`):**
+   - Ekstraksi metadata GeoTIFF menggunakan Rasterio.
+   - Segmentasi citra tanaman padi matang (siap panen) vs belum matang menggunakan *color space* HSV adaptif dan CLAHE.
+   - Komunikasi otomatis dengan NodeODM untuk menghasilkan orthophoto resolusi tinggi.
+4. **Keamanan & Autentikasi:**
+   - Autentikasi operator berbasis HMAC-SHA256 *signed cookie* (Edge compatible).
+   - Password disimpan dengan algoritma `scrypt`.
+   - Pencegahan *path traversal* pada berkas upload dan output geospasial.

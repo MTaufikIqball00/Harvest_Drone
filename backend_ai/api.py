@@ -33,6 +33,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from urllib.parse import urlparse
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
@@ -89,6 +91,16 @@ JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", str(6 * 3600)))
 # beberapa request paralel akan meng-OOM mesin. Semaphore membatasi berapa
 # banyak yang boleh berjalan bersamaan.
 MAX_CONCURRENT_CLASSIFY = int(os.getenv("MAX_CONCURRENT_CLASSIFY", "2"))
+
+
+def get_nodeodm_config() -> tuple[str, int, str]:
+    """Baca URL dan kredensial NodeODM dari environment variables."""
+    odm_url = os.getenv("ODM_NODE_URL", "http://localhost:3001")
+    parsed = urlparse(odm_url)
+    host = parsed.hostname or os.getenv("ODM_HOST", "localhost")
+    port = parsed.port or int(os.getenv("ODM_PORT", "3001"))
+    token = os.getenv("ODM_TOKEN", "")
+    return host, port, token
 
 
 def now_epoch_ms() -> int:
@@ -345,7 +357,8 @@ async def nodeodm_status():
     # cek_nodeodm() melakukan I/O jaringan yang memblokir; jalankan di
     # threadpool supaya event loop tetap melayani request lain.
     try:
-        return await run_in_threadpool(stitching.cek_nodeodm)
+        host, port, token = get_nodeodm_config()
+        return await run_in_threadpool(stitching.cek_nodeodm, host=host, port=port, token=token)
     except stitching.StitchingError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -463,10 +476,14 @@ def _run_stitch_job(job_id: str, image_paths: list[Path]) -> None:
         JOBS.update(job_id, progress=int(pct), message=str(status))
 
     try:
+        host, port, token = get_nodeodm_config()
         ortho_path = stitching.stitch(
             image_paths=image_paths,
             output_dir=ORTHO_DIR / job_id,
             task_name=f"rice_paddy_{job_id}",
+            host=host,
+            port=port,
+            token=token,
             progress_callback=on_progress,
         )
         JOBS.update(

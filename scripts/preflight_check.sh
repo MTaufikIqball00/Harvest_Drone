@@ -3,11 +3,11 @@
 # scripts/preflight_check.sh - Pre-flight environment validator
 # =============================================================================
 
-GREEN='\030[0;32m'
-RED='\030[0;31m'
-YELLOW='\030[1;33m'
-CYAN='\030[0;36m'
-NC='\030[0m'
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 
 echo -e "${CYAN}=====================================================${NC}"
 echo -e "${CYAN}   DRONE-STACK MONOREPO PRE-FLIGHT CHECK SYSTEM     ${NC}"
@@ -18,11 +18,16 @@ ERRORS=0
 check_cmd() {
     local name="$1"
     local cmd="$2"
+    local optional="$3"
     if command -v $cmd >/dev/null 2>&1; then
         echo -e "[CHECK] $name ... ${GREEN}PASSED${NC}"
     else
-        echo -e "[CHECK] $name ... ${RED}FAILED (Command '$cmd' not found)${NC}"
-        ERRORS=$((ERRORS + 1))
+        if [ "$optional" = "optional" ]; then
+            echo -e "[CHECK] $name ... ${YELLOW}OPTIONAL NOT FOUND ('$cmd')${NC}"
+        else
+            echo -e "[CHECK] $name ... ${RED}FAILED (Command '$cmd' not found)${NC}"
+            ERRORS=$((ERRORS + 1))
+        fi
     fi
 }
 
@@ -40,8 +45,8 @@ echo -e "\n${CYAN}--- Checking Required Binaries ---${NC}"
 check_cmd "Python 3" "python3"
 check_cmd "Node.js" "node"
 check_cmd "npm" "npm"
-check_cmd "MySQL Client" "mysql"
-check_cmd "Gazebo Sim" "gz"
+check_cmd "PostgreSQL Client" "psql" "optional"
+check_cmd "Gazebo Sim" "gz" "optional"
 
 echo -e "\n${CYAN}--- Checking ROS 2 Environment ---${NC}"
 if [ -f "/opt/ros/jazzy/setup.bash" ]; then
@@ -56,7 +61,8 @@ check_port 3000 "Next.js Frontend"
 check_port 8000 "FastAPI AI Backend"
 check_port 9090 "ROSBridge WebSocket"
 check_port 8888 "Micro XRCE-DDS UDP"
-check_port 14540 "MAVROS MAVLink UDP"
+check_port 14551 "MAVROS FCU UDP"
+check_port 14550 "MAVLink SITL/GCS"
 
 echo -e "\n${CYAN}-----------------------------------------------------${NC}"
 if [ $ERRORS -eq 0 ]; then

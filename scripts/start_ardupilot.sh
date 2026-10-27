@@ -3,8 +3,8 @@
 # scripts/start_ardupilot.sh - Launch ArduPilot SITL (for Mission Planner / MAVLink)
 # =============================================================================
 
-ARDUPILOT_DIR="/home/iqball/ardupilot"
-VENV_DIR="/home/iqball/venv-ardupilot"
+ARDUPILOT_DIR="${ARDUPILOT_DIR:-/home/iqball/ardupilot}"
+VENV_DIR="${VENV_DIR:-/home/iqball/venv-ardupilot}"
 
 echo "=== Starting ArduPilot SITL ==="
 if [ -d "$VENV_DIR" ]; then
